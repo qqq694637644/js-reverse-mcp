@@ -4,6 +4,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+import {randomUUID} from 'node:crypto';
 import {constants as fsConstants} from 'node:fs';
 import fs from 'node:fs/promises';
 import os from 'node:os';
@@ -13,7 +14,10 @@ import {CdpSessionProvider} from './CdpSessionProvider.js';
 import {DebuggerContext} from './DebuggerContext.js';
 import {extractUrlLikeFromDevToolsTitle, urlsEqual} from './DevtoolsUtils.js';
 import type {TrafficSummary} from './formatters/websocketFormatter.js';
-import {assertLocalFileWriteAllowed} from './LocalFileAccess.js';
+import {
+  assertLocalFileWriteAllowed,
+  getAllowedRoots,
+} from './LocalFileAccess.js';
 import {NetworkCollector, ConsoleCollector} from './PageCollector.js';
 import type {ListenerMap, RequestInitiator} from './PageCollector.js';
 import type {StreamCapture, StreamCaptureFilter} from './StreamCollector.js';
@@ -78,7 +82,11 @@ export class McpContext implements Context {
     Map<number, {version: number; summary: TrafficSummary}>
   >();
 
-  private constructor(browserContext: BrowserContext, logger: Debugger) {
+  private constructor(
+    browserContext: BrowserContext,
+    logger: Debugger,
+    options: {streamMaxBytes?: number} = {},
+  ) {
     this.browserContext = browserContext;
     this.sessionProvider = new CdpSessionProvider(browserContext);
     this.logger = logger;
@@ -116,6 +124,7 @@ export class McpContext implements Context {
     this.#streamCollector = new StreamCollector(
       this.browserContext,
       this.sessionProvider,
+      {maxDiskBytesPerCapture: options.streamMaxBytes},
     );
   }
 
@@ -279,8 +288,12 @@ export class McpContext implements Context {
     }
   }
 
-  static async from(browserContext: BrowserContext, logger: Debugger) {
-    const context = new McpContext(browserContext, logger);
+  static async from(
+    browserContext: BrowserContext,
+    logger: Debugger,
+    options: {streamMaxBytes?: number} = {},
+  ) {
+    const context = new McpContext(browserContext, logger, options);
     await context.#init();
     return context;
   }
@@ -363,59 +376,50 @@ export class McpContext implements Context {
 
   async startStreamCapture(
     filter: StreamCaptureFilter,
-    outputDir: string,
   ): Promise<StreamCapture> {
-    let resolvedOutputDir = path.resolve(outputDir);
+    const roots = getAllowedRoots();
+    if (!roots?.length) {
+      throw new ToolError(
+        'PERMISSION_DENIED',
+        'Streaming capture requires --allowedRoots so artifacts are written into a shared, bounded workspace.',
+      );
+    }
+    const rootIndex = 0;
+    const relativeDir = path.join(
+      'js-reverse-streams',
+      `capture-${Date.now()}-${randomUUID()}`,
+    );
+    const absoluteDir = path.join(roots[rootIndex], relativeDir);
     try {
-      resolvedOutputDir = assertLocalFileWriteAllowed(resolvedOutputDir);
-      await fs.mkdir(resolvedOutputDir, {mode: 0o700});
+      await fs.mkdir(path.dirname(absoluteDir), {recursive: true, mode: 0o700});
+      await fs.mkdir(absoluteDir, {mode: 0o700});
     } catch (error) {
-      if (error instanceof ToolError) {
-        throw error;
-      }
-      if (
-        typeof error === 'object' &&
-        error !== null &&
-        'code' in error &&
-        error.code === 'EEXIST'
-      ) {
-        throw new ToolError(
-          'CONFIRMATION_REQUIRED',
-          `Stream output directory already exists: ${resolvedOutputDir}. Choose a new directory so evidence is never mixed or overwritten.`,
-          {cause: error},
-        );
-      }
       throw new ToolError(
         'IO_ERROR',
-        `Could not create stream output directory: ${resolvedOutputDir}`,
+        'Could not allocate a unique streaming capture directory.',
         {cause: error},
       );
     }
     try {
-      return this.#streamCollector.startCapture(
+      return await this.#streamCollector.startCapture(
         this.getSelectedPage(),
         filter,
-        resolvedOutputDir,
+        {rootIndex, absoluteDir, relativeDir},
       );
     } catch (error) {
-      await fs.rmdir(resolvedOutputDir).catch(() => undefined);
+      await fs
+        .rm(absoluteDir, {recursive: true, force: true})
+        .catch(() => undefined);
       throw error;
     }
   }
 
   getStreamCapture(captureId: number): StreamCapture {
-    return this.#streamCollector.getById(this.getSelectedPage(), captureId);
+    return this.#streamCollector.getById(captureId);
   }
 
   async stopStreamCapture(captureId: number): Promise<StreamCapture> {
-    return this.#streamCollector.stopCapture(this.getSelectedPage(), captureId);
-  }
-
-  async flushStreamCapture(captureId: number): Promise<StreamCapture> {
-    return this.#streamCollector.flushCapture(
-      this.getSelectedPage(),
-      captureId,
-    );
+    return this.#streamCollector.stopCapture(captureId);
   }
 
   getDialog(): Dialog | undefined {

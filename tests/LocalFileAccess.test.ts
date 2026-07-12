@@ -114,6 +114,18 @@ test('omitting allowed roots preserves unrestricted compatibility', () => {
   );
 });
 
+test('stream capture requires an allowed root even when other file tools remain unrestricted', async () => {
+  configureAllowedRoots();
+  await assert.rejects(
+    McpContext.prototype.startStreamCapture.call(
+      {} as unknown as McpContext,
+      {},
+    ),
+    (error: unknown) =>
+      error instanceof ToolError && error.code === 'PERMISSION_DENIED',
+  );
+});
+
 test('allowed roots disable browser file and view-source:file pages', async () => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'mcp-browser-root-'));
   try {

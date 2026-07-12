@@ -128,7 +128,7 @@ npm run build
 
 **何时开 `--cloak`**：只在以上还不够、被站点指纹拦截时才用。详见 [docs/cloak.md](docs/cloak.md)。
 
-## 工具列表（28 个）
+## 工具列表（27 个）
 
 ### 页面与导航
 
@@ -164,16 +164,15 @@ npm run build
 
 ### 网络、流式响应与 WebSocket
 
-| 工具                     | 描述                                                         |
-| ------------------------ | ------------------------------------------------------------ |
-| `list_network_requests`  | 列出网络请求、查看详情，或导出 header/body/query 等原始材料  |
-| `clear_network_requests` | 显式确认后清空当前页面已收集的请求和 body cache              |
-| `get_request_initiator`  | 获取网络请求的 JavaScript 调用栈                             |
-| `start_stream_capture`   | 在操作前把 fetch/XHR SSE 与 EventSource 流解码并写入工作目录 |
-| `get_stream_status`      | 查看状态、文件路径和可选 chunk offset，不返回事件正文        |
-| `stop_stream_capture`    | 停止捕获、刷新增量解析并写完 metadata                        |
-| `export_stream_capture`  | 刷新文件并返回 artifact 索引，不返回 Base64 或大正文         |
-| `get_websocket_messages` | 列出 WebSocket 连接、分析消息模式或获取消息详情              |
+| 工具                     | 描述                                                        |
+| ------------------------ | ----------------------------------------------------------- |
+| `list_network_requests`  | 列出网络请求、查看详情，或导出 header/body/query 等原始材料 |
+| `clear_network_requests` | 显式确认后清空当前页面已收集的请求和 body cache             |
+| `get_request_initiator`  | 获取网络请求的 JavaScript 调用栈                            |
+| `start_stream_capture`   | 启动流捕获；服务端在第一个 allowed root 下自动分配唯一目录  |
+| `get_stream_status`      | 按全局 capture ID 查看状态、相对路径和最近 chunk offset     |
+| `stop_stream_capture`    | 等待激活和写队列，完成 metadata，并返回最终 artifact 索引   |
+| `get_websocket_messages` | 列出 WebSocket 连接、分析消息模式或获取消息详情             |
 
 ### 浏览器状态
 
@@ -227,11 +226,11 @@ npm run build
 流捕获不是追溯式的，应在触发页面操作前启动：
 
 ```text
-1. start_stream_capture：指定新的工作目录，并按 URL、method、resource type 或 MIME 缩小范围
-2. 在页面中触发 fetch/XHR/EventSource 请求
-3. get_stream_status：查看完成状态、事件计数、文件路径和可选 chunk offset
-4. stop_stream_capture：停止并刷新 raw.bin、raw.sse、events.jsonl、chunks.jsonl 和 metadata
-5. export_stream_capture：返回 artifact 文件索引
+1. 用 `--allowedRoots` 指向与 Gateway workspace 共享或映射的目录
+2. 后端调用 start_stream_capture；服务端自动分配唯一 capture 目录
+3. 后端在同一次实验中触发 fetch/XHR/EventSource 请求
+4. get_stream_status：只查看状态、计数、相对路径和最近 chunk offset
+5. stop_stream_capture：等待激活、pending chunk 和写队列，完成 manifest 并返回 artifact 索引
 6. 使用 workspace 文件工具读取、搜索和分析 events.jsonl / raw.sse
 ```
 
@@ -261,13 +260,16 @@ npm run build
 
 CLI 保持精简，所有 flag 都是可选项。**99% 场景默认即可**。涉及本地文件时，建议用 `--allowedRoots` 限定 Agent 可读写的目录。
 
-| 选项               | 描述                                                                                                                                                                                                                      | 默认值  |
-| ------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------- |
-| `--cloak`          | 切换到 CloakBrowser 隐身二进制（取代系统 Chrome）。启用按平台提供的 C++ 源码层指纹 patch。首次启动自动下载 ~200MB 二进制；指纹身份按 profile 持久化。详见 [docs/cloak.md](docs/cloak.md)。                                | `false` |
-| `--isolated`       | 使用临时 user-data-dir（cookies/localStorage 不保留，关闭时自动清理）                                                                                                                                                     | `false` |
-| `--browserUrl, -u` | 连接到已运行的 Chrome 实例（CDP HTTP 端点，如 `http://127.0.0.1:9222`）。MCP 会自动探测出 WebSocket debugger URL。本地 Chrome、AdsPower、BitBrowser 等怎么拿到这个端点详见 [docs/cdp-endpoint.md](docs/cdp-endpoint.md)。 | –       |
-| `--logFile`        | 写入 `0600` 普通文件的 MCP 调试日志；详细日志仅使用 `DEBUG=mcp:*`。不要使用 `DEBUG=*`，浏览器协议日志可能泄露页面、Cookie、脚本和凭据。                                                                                   | –       |
-| `--allowedRoots`   | 可重复指定 Agent 允许读写的本地目录；解析真实路径并拒绝符号链接越界。启用时禁用 `file:`、`view-source:file:` 和 `filesystem:file:` 浏览器页面。未指定时本地文件访问不受目录限制，启动时会打印安全警告。                   | –       |
+| 选项               | 描述                                                                                                                                                                                                                      | 默认值      |
+| ------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------- |
+| `--cloak`          | 切换到 CloakBrowser 隐身二进制（取代系统 Chrome）。启用按平台提供的 C++ 源码层指纹 patch。首次启动自动下载 ~200MB 二进制；指纹身份按 profile 持久化。详见 [docs/cloak.md](docs/cloak.md)。                                | `false`     |
+| `--isolated`       | 使用临时 user-data-dir（cookies/localStorage 不保留，关闭时自动清理）                                                                                                                                                     | `false`     |
+| `--browserUrl, -u` | 连接到已运行的 Chrome 实例（CDP HTTP 端点，如 `http://127.0.0.1:9222`）。MCP 会自动探测出 WebSocket debugger URL。本地 Chrome、AdsPower、BitBrowser 等怎么拿到这个端点详见 [docs/cdp-endpoint.md](docs/cdp-endpoint.md)。 | –           |
+| `--logFile`        | 写入 `0600` 普通文件的 MCP 调试日志；详细日志仅使用 `DEBUG=mcp:*`。不要使用 `DEBUG=*`，浏览器协议日志可能泄露页面、Cookie、脚本和凭据。                                                                                   | –           |
+| `--allowedRoots`   | 可重复指定 Agent 允许读写的本地目录；解析真实路径并拒绝符号链接越界。启用时禁用 `file:`、`view-source:file:` 和 `filesystem:file:` 浏览器页面。未指定时本地文件访问不受目录限制，启动时会打印安全警告。                   | –           |
+| `--streamMaxBytes` | 单次流捕获允许写入的最大磁盘字节数。超过配额后捕获会明确标记为失败，并在 manifest 中记录截断时间、丢弃 chunk 数量和丢弃字节数。                                                                                           | `536870912` |
+
+流捕获工具强制要求 `--allowedRoots`。网页版集成中，`js-reverse-mcp` 与 Gateway workspace 必须看到同一个文件系统目录，或通过容器 volume 映射到相同内容；MCP 只返回 allowed-root 索引、workspace 相对路径和 opaque artifact ID，不返回宿主机绝对路径。
 
 ### 示例配置
 

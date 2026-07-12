@@ -195,13 +195,9 @@ export type Context = Readonly<{
    * dropped so the caller can report it.
    */
   clearNetworkRequests(): {requestCount: number; reclaimedBytes: number};
-  startStreamCapture(
-    filter: StreamCaptureFilter,
-    outputDir: string,
-  ): Promise<StreamCapture>;
+  startStreamCapture(filter: StreamCaptureFilter): Promise<StreamCapture>;
   getStreamCapture(captureId: number): StreamCapture;
   stopStreamCapture(captureId: number): Promise<StreamCapture>;
-  flushStreamCapture(captureId: number): Promise<StreamCapture>;
   /**
    * Get all WebSocket connections for the selected page.
    */

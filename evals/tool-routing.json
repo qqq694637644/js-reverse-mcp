@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "expectedToolCount": 28,
+  "expectedToolCount": 27,
   "cases": [
     {
       "id": "console-errors",
@@ -245,10 +245,9 @@
     {
       "id": "start-sse-capture",
       "category": "streaming",
-      "prompt": "Before I submit the next chat message, arm streaming response capture under the new directory /tmp/conversation-stream for POST fetch requests whose URL contains /conversation.",
+      "prompt": "Before I submit the next chat message, arm streaming response capture for POST fetch requests whose URL contains /conversation. Let the server allocate the artifact directory.",
       "expectedTool": "start_stream_capture",
       "expectedArgs": {
-        "outputDir": "/tmp/conversation-stream",
         "urlFilter": "/conversation",
         "methods": ["POST"],
         "resourceTypes": ["fetch"]
@@ -262,7 +261,7 @@
       "expectedArgs": {
         "captureId": 4,
         "requestId": "123.4",
-        "includeChunks": true
+        "includeRecentChunks": true
       }
     },
     {
@@ -271,16 +270,6 @@
       "prompt": "The reproduced streaming action is complete. Stop stream capture 4 without cancelling the browser request.",
       "expectedTool": "stop_stream_capture",
       "expectedArgs": {"captureId": 4}
-    },
-    {
-      "id": "export-sse-bytes",
-      "category": "streaming",
-      "prompt": "Flush stream capture 4 and return the artifact file index for request 123.4; do not return raw bytes or Base64 inline.",
-      "expectedTool": "export_stream_capture",
-      "expectedArgs": {
-        "captureId": 4,
-        "requestId": "123.4"
-      }
     }
   ]
 }

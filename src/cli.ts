@@ -42,6 +42,18 @@ export const cliOptions = {
     description:
       'Optional directories that local-file tools may read from or write to. Repeat the flag for multiple roots. Roots are resolved at startup and symlink escapes are rejected. While configured, file:, view-source:file:, and filesystem:file: browser pages are disabled. When omitted, local-file access is unrestricted and a security warning is printed.',
   },
+  streamMaxBytes: {
+    type: 'number',
+    description:
+      'Maximum on-disk bytes reserved for one streaming-response capture. Defaults to 536870912 (512 MiB). Exceeding the quota marks the capture failed and records explicit truncation statistics.',
+    default: 512 * 1024 * 1024,
+    coerce: (value: number) => {
+      if (!Number.isSafeInteger(value) || value <= 0) {
+        throw new Error('streamMaxBytes must be a positive safe integer.');
+      }
+      return value;
+    },
+  },
   cloak: {
     type: 'boolean',
     description:

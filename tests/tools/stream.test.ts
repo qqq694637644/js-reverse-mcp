@@ -9,49 +9,80 @@ import {test} from 'node:test';
 
 import {zod} from '../../src/third_party/index.js';
 import {
-  exportStreamCapture,
+  assertSafeStreamToolOutput,
   getStreamStatus,
   startStreamCapture,
   stopStreamCapture,
 } from '../../src/tools/stream.js';
 
-test('stream capture schemas require an output directory and use small status defaults', () => {
+test('stream start schema does not accept a caller-provided output directory', () => {
+  const parsed = zod
+    .object(startStreamCapture.schema)
+    .strict()
+    .parse({
+      urlFilter: '/conversation',
+      methods: ['POST'],
+      resourceTypes: ['fetch'],
+    });
+  assert.deepEqual(parsed, {
+    urlFilter: '/conversation',
+    methods: ['POST'],
+    resourceTypes: ['fetch'],
+  });
   assert.throws(
-    () => zod.object(startStreamCapture.schema).parse({}),
-    /outputDir/,
+    () =>
+      zod.object(startStreamCapture.schema).strict().parse({
+        outputDir: '/tmp/user-controlled',
+      }),
+    /Unrecognized key|unrecognized key/i,
   );
-  const start = zod.object(startStreamCapture.schema).parse({
-    outputDir: 'captures/exp-1/stream-1',
-  });
-  assert.equal(start.urlFilter, undefined);
-  assert.equal(start.mimeTypes, undefined);
-
-  const status = zod
-    .object(getStreamStatus.schema)
-    .parse({captureId: 1, requestId: 'req-1'});
-  assert.equal(status.includeChunks, false);
-  assert.equal(status.pageIdx, 0);
-  assert.equal(status.pageSize, 100);
-
-  const exported = zod.object(exportStreamCapture.schema).parse({
-    captureId: 1,
-  });
-  assert.equal(exported.requestId, undefined);
 });
 
-test('stream tools declare the stream capability', () => {
-  for (const tool of [
-    startStreamCapture,
-    getStreamStatus,
-    stopStreamCapture,
-    exportStreamCapture,
-  ]) {
+test('stream tools expose only start, status, and stop responsibilities', () => {
+  assert.equal(startStreamCapture.name, 'start_stream_capture');
+  assert.equal(getStreamStatus.name, 'get_stream_status');
+  assert.equal(stopStreamCapture.name, 'stop_stream_capture');
+  for (const tool of [startStreamCapture, getStreamStatus, stopStreamCapture]) {
     assert.deepEqual(tool.capabilities, ['stream']);
   }
 });
 
-test('stream status and export descriptions forbid large Base64 MCP output', () => {
-  assert.match(getStreamStatus.description, /never returns CDP Base64/i);
-  assert.match(exportStreamCapture.description, /never returns.*Base64/i);
-  assert.match(startStreamCapture.description, /decoded immediately/i);
+test('status schema defaults to bounded summaries', () => {
+  const parsed = zod.object(getStreamStatus.schema).parse({captureId: 1});
+  assert.equal(parsed.includeRecentChunks, false);
+  assert.equal(parsed.pageIdx, 0);
+  assert.equal(parsed.pageSize, 20);
+});
+
+test('recursive stream output guard rejects body and Base64 fields', () => {
+  assert.doesNotThrow(() =>
+    assertSafeStreamToolOutput({
+      captureId: 1,
+      relativePath: 'js-reverse-streams/capture-1/capture.json',
+      recentEvents: [{index: 1, dataLength: 42}],
+    }),
+  );
+  assert.throws(
+    () => assertSafeStreamToolOutput({request: {dataBase64: 'AAAA'}}),
+    /forbidden field/i,
+  );
+  assert.throws(
+    () => assertSafeStreamToolOutput({request: {body: 'secret'}}),
+    /forbidden field/i,
+  );
+  assert.throws(
+    () => assertSafeStreamToolOutput({request: {data: 'event body'}}),
+    /forbidden field/i,
+  );
+  assert.throws(
+    () => assertSafeStreamToolOutput({request: {base64: 'AAAA'}}),
+    /forbidden field/i,
+  );
+});
+
+test('recursive stream output guard rejects overlong strings', () => {
+  assert.throws(
+    () => assertSafeStreamToolOutput({value: 'x'.repeat(8193)}),
+    /overlong string/i,
+  );
 });

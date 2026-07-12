@@ -12,74 +12,58 @@ import path from 'node:path';
 import {test} from 'node:test';
 
 import type {CdpSessionProvider} from '../src/CdpSessionProvider.js';
-import {parseSseEvents, StreamCollector} from '../src/StreamCollector.js';
+import {
+  parseSseEvents,
+  StreamCollector,
+  type StreamCaptureLocation,
+} from '../src/StreamCollector.js';
 import type {
   BrowserContext,
   CDPSession,
   Page,
 } from '../src/third_party/index.js';
 
+interface Deferred<T> {
+  promise: Promise<T>;
+  resolve(value: T): void;
+  reject(error: unknown): void;
+}
+
+function deferred<T>(): Deferred<T> {
+  let resolve!: (value: T) => void;
+  let reject!: (error: unknown) => void;
+  const promise = new Promise<T>((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+  return {promise, resolve, reject};
+}
+
+interface MockSession {
+  emit(event: string, payload: unknown): void;
+}
+
+interface MockPageControl {
+  page: Page;
+  session: MockSession;
+  close(): void;
+}
+
 function createFixture(
   options: {
     streamResourceContent?: (
       requestId: string,
+      pageIndex: number,
     ) => Promise<{bufferedData?: string}>;
+    maxDiskBytesPerCapture?: number;
   } = {},
 ) {
-  const cdpHandlers = new Map<string, Set<(payload: unknown) => void>>();
-  const pageHandlers = new Map<string, Set<(payload: unknown) => void>>();
+  const pages: Page[] = [];
+  const pageSessions = new Map<Page, CDPSession>();
   const contextHandlers = new Map<string, Set<(payload: unknown) => void>>();
-  const session = {
-    on(event: string, listener: (payload: unknown) => void) {
-      let listeners = cdpHandlers.get(event);
-      if (!listeners) {
-        listeners = new Set();
-        cdpHandlers.set(event, listeners);
-      }
-      listeners.add(listener);
-      return session;
-    },
-    off(event: string, listener: (payload: unknown) => void) {
-      cdpHandlers.get(event)?.delete(listener);
-      return session;
-    },
-    async send(method: string, params?: {requestId?: string}) {
-      if (method === 'Network.enable') {
-        return {};
-      }
-      if (method === 'Network.streamResourceContent') {
-        return (
-          options.streamResourceContent?.(params?.requestId ?? '') ??
-          Promise.resolve({bufferedData: ''})
-        );
-      }
-      return {};
-    },
-    emit(event: string, payload: unknown) {
-      for (const listener of cdpHandlers.get(event) ?? []) {
-        listener(payload);
-      }
-    },
-  };
-  const mainFrame = {};
-  const page = {
-    on(event: string, listener: (payload: unknown) => void) {
-      let listeners = pageHandlers.get(event);
-      if (!listeners) {
-        listeners = new Set();
-        pageHandlers.set(event, listeners);
-      }
-      listeners.add(listener);
-      return page;
-    },
-    off(event: string, listener: (payload: unknown) => void) {
-      pageHandlers.get(event)?.delete(listener);
-      return page;
-    },
-    mainFrame: () => mainFrame,
-  } as unknown as Page;
+
   const context = {
-    pages: () => [page],
+    pages: () => [...pages],
     on(event: string, listener: (payload: unknown) => void) {
       let listeners = contextHandlers.get(event);
       if (!listeners) {
@@ -92,22 +76,102 @@ function createFixture(
       contextHandlers.get(event)?.delete(listener);
     },
   } as unknown as BrowserContext;
+
   const collector = new StreamCollector(
     context,
     {
-      getSession: async () => session as unknown as CDPSession,
+      getSession: async (page: Page) => pageSessions.get(page)!,
     } as unknown as CdpSessionProvider,
     {
-      maxCaptures: 5,
-      maxBytesPerCapture: 1024 * 1024,
-      maxChunksPerCapture: 100,
+      maxCaptures: 20,
+      maxDiskBytesPerCapture: options.maxDiskBytesPerCapture ?? 1024 * 1024,
+      maxRecentChunksPerRequest: 10,
+      maxRecentEventsPerRequest: 10,
     },
   );
-  return {cdpHandlers, collector, page, session};
+
+  function addPage(
+    url = `https://example.test/page-${pages.length + 1}`,
+  ): MockPageControl {
+    const pageIndex = pages.length;
+    const pageHandlers = new Map<string, Set<(payload: unknown) => void>>();
+    const cdpHandlers = new Map<string, Set<(payload: unknown) => void>>();
+    let closed = false;
+    const page = {
+      on(event: string, listener: (payload: unknown) => void) {
+        let listeners = pageHandlers.get(event);
+        if (!listeners) {
+          listeners = new Set();
+          pageHandlers.set(event, listeners);
+        }
+        listeners.add(listener);
+        return page;
+      },
+      off(event: string, listener: (payload: unknown) => void) {
+        pageHandlers.get(event)?.delete(listener);
+        return page;
+      },
+      url: () => url,
+      title: async () => `Page ${pageIndex + 1}`,
+      isClosed: () => closed,
+      mainFrame: () => ({}),
+    } as unknown as Page;
+    const session = {
+      on(event: string, listener: (payload: unknown) => void) {
+        let listeners = cdpHandlers.get(event);
+        if (!listeners) {
+          listeners = new Set();
+          cdpHandlers.set(event, listeners);
+        }
+        listeners.add(listener);
+        return session;
+      },
+      off(event: string, listener: (payload: unknown) => void) {
+        cdpHandlers.get(event)?.delete(listener);
+        return session;
+      },
+      async send(method: string, params?: {requestId?: string}) {
+        if (method === 'Network.enable') {
+          return {};
+        }
+        if (method === 'Network.streamResourceContent') {
+          return (
+            options.streamResourceContent?.(
+              params?.requestId ?? '',
+              pageIndex,
+            ) ?? Promise.resolve({bufferedData: ''})
+          );
+        }
+        return {};
+      },
+      emit(event: string, payload: unknown) {
+        for (const listener of cdpHandlers.get(event) ?? []) {
+          listener(payload);
+        }
+      },
+    } as unknown as CDPSession & MockSession;
+    pages.push(page);
+    pageSessions.set(page, session);
+    for (const listener of contextHandlers.get('page') ?? []) {
+      listener(page);
+    }
+    return {
+      page,
+      session,
+      close() {
+        closed = true;
+        for (const listener of pageHandlers.get('close') ?? []) {
+          listener(undefined);
+        }
+      },
+    };
+  }
+
+  return {collector, addPage};
 }
 
 function emitRequestStart(
-  session: {emit(event: string, payload: unknown): void},
+  session: MockSession,
   options: {
     requestId?: string;
     url?: string;
@@ -130,32 +194,28 @@ function emitRequestStart(
     requestId,
     timestamp: 2,
     type,
-    response: {
-      url,
-      mimeType: options.mimeType ?? 'text/event-stream',
-    },
+    response: {url, mimeType: options.mimeType ?? 'text/event-stream'},
   });
   return requestId;
 }
 
 function emitBytes(
-  session: {emit(event: string, payload: unknown): void},
+  session: MockSession,
   requestId: string,
   bytes: Uint8Array,
   timestamp: number,
 ): void {
-  const data = Buffer.from(bytes).toString('base64');
   session.emit('Network.dataReceived', {
     requestId,
     timestamp,
     dataLength: bytes.length,
     encodedDataLength: bytes.length,
-    data,
+    data: Buffer.from(bytes).toString('base64'),
   });
 }
 
 function emitText(
-  session: {emit(event: string, payload: unknown): void},
+  session: MockSession,
   requestId: string,
   text: string,
   timestamp: number,
@@ -163,15 +223,35 @@ function emitText(
   emitBytes(session, requestId, Buffer.from(text, 'utf8'), timestamp);
 }
 
+function emitFinished(
+  session: MockSession,
+  requestId: string,
+  timestamp = 5,
+): void {
+  session.emit('Network.loadingFinished', {
+    requestId,
+    timestamp,
+    encodedDataLength: 100,
+  });
+}
+
 async function flushMicrotasks(): Promise<void> {
   await new Promise(resolve => setTimeout(resolve, 0));
 }
 
-async function createOutputDir(): Promise<{root: string; outputDir: string}> {
+async function createLocation(name: string): Promise<{
+  root: string;
+  location: StreamCaptureLocation;
+}> {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'stream-collector-'));
-  const outputDir = path.join(root, 'capture');
-  await fs.mkdir(outputDir);
-  return {root, outputDir};
+  const relativeDir = path.join('captures', name);
+  const absoluteDir = path.join(root, relativeDir);
+  await fs.mkdir(absoluteDir, {recursive: true});
+  return {root, location: {rootIndex: 0, absoluteDir, relativeDir}};
+}
+
+function artifactPath(root: string, artifact: {relativePath: string}): string {
+  return path.join(root, ...artifact.relativePath.split('/'));
 }
 
 async function readJsonLines(
@@ -184,163 +264,158 @@ async function readJsonLines(
     .map(line => JSON.parse(line) as Record<string, unknown>);
 }
 
-test('parseSseEvents preserves event order and the done marker', () => {
-  const raw = Buffer.from(
-    'event: message\ndata: {"sequence":1}\n\n' +
-      'data: line one\ndata: line two\n\n' +
+test('parseSseEvents distinguishes heartbeat records and preserves DONE', () => {
+  const parsed = parseSseEvents(
+    Buffer.from(
       ': heartbeat\n\n' +
-      'event: done\ndata: [DONE]\n\n' +
-      'data: incomplete',
-    'utf8',
+        'event: message\ndata: {"sequence":1}\n\n' +
+        'event: done\ndata: [DONE]\n\n' +
+        'data: incomplete',
+    ),
   );
-
-  const parsed = parseSseEvents(raw);
-
   assert.deepEqual(
     parsed.events.map(event => ({
       index: event.index,
-      name: event.eventName,
+      recordType: event.recordType,
+      eventName: event.eventName,
       data: event.data,
       done: event.done,
-      comments: event.comments,
     })),
     [
       {
         index: 0,
-        name: 'message',
-        data: '{"sequence":1}',
+        recordType: 'heartbeat',
+        eventName: undefined,
+        data: '',
         done: false,
-        comments: [],
       },
       {
         index: 1,
-        name: 'message',
-        data: 'line one\nline two',
+        recordType: 'event',
+        eventName: 'message',
+        data: '{"sequence":1}',
         done: false,
-        comments: [],
       },
       {
         index: 2,
-        name: 'message',
-        data: '',
-        done: false,
-        comments: ['heartbeat'],
-      },
-      {
-        index: 3,
-        name: 'done',
+        recordType: 'event',
+        eventName: 'done',
         data: '[DONE]',
         done: true,
-        comments: [],
       },
     ],
   );
   assert.equal(parsed.incompleteTail, 'data: incomplete');
 });
 
-test('decodes CDP Base64 immediately and writes analysis files without Base64', async () => {
-  const first = 'event: message\ndata: {"sequence":1}\n\n';
-  const {root, outputDir} = await createOutputDir();
-  const {collector, page, session} = createFixture({
-    streamResourceContent: async () => ({
-      bufferedData: Buffer.from(first, 'utf8').toString('base64'),
-    }),
+test('activation barrier writes bufferedData before chunks received while activation is pending', async () => {
+  const activation = deferred<{bufferedData?: string}>();
+  const {collector, addPage} = createFixture({
+    streamResourceContent: () => activation.promise,
   });
+  const control = addPage();
+  const {root, location} = await createLocation('ordered');
   try {
-    await collector.addPage(page);
-    const capture = collector.startCapture(
-      page,
-      {urlFilter: '/api/stream', methods: ['POST']},
-      outputDir,
-    );
-
-    const requestId = emitRequestStart(session);
-    await flushMicrotasks();
-    emitText(session, requestId, 'event: message\ndata: {"sequence":2}\n\n', 3);
-    emitText(session, requestId, 'event: done\ndata: [DONE]\n\n', 4);
-    session.emit('Network.loadingFinished', {
-      requestId,
-      timestamp: 5,
-      encodedDataLength: 100,
+    await collector.addPage(control.page);
+    const capture = await collector.startCapture(control.page, {}, location);
+    const requestId = emitRequestStart(control.session);
+    emitText(control.session, requestId, 'data: later\n\n', 3);
+    activation.resolve({
+      bufferedData: Buffer.from('data: earlier\n\n').toString('base64'),
     });
-    const stopped = await collector.stopCapture(page, capture.id);
+    emitFinished(control.session, requestId);
+    await collector.stopCapture(capture.id);
 
-    const request = stopped.requests[0];
-    const rawFile = request.files.find(file => file.kind === 'raw_bytes')!.path;
-    const rawTextFile = request.files.find(
-      file => file.kind === 'raw_text',
-    )!.path;
-    const eventsFile = request.files.find(file => file.kind === 'events')!.path;
-    const chunksFile = request.files.find(file => file.kind === 'chunks')!.path;
-    const expected =
-      first +
-      'event: message\ndata: {"sequence":2}\n\n' +
-      'event: done\ndata: [DONE]\n\n';
-    const secondChunk = 'event: message\ndata: {"sequence":2}\n\n';
-
-    assert.equal((await fs.readFile(rawFile)).toString('utf8'), expected);
-    assert.equal(await fs.readFile(rawTextFile, 'utf8'), expected);
-    const events = await readJsonLines(eventsFile);
-    assert.deepEqual(
-      events.map(event => ({
-        index: event.index,
-        done: event.done,
-        dataJson: event.dataJson,
-        data: event.data,
-      })),
-      [
-        {index: 0, done: false, dataJson: {sequence: 1}, data: undefined},
-        {index: 1, done: false, dataJson: {sequence: 2}, data: undefined},
-        {index: 2, done: true, dataJson: undefined, data: '[DONE]'},
-      ],
+    const raw = capture.requests[0].artifacts.find(
+      artifact => artifact.kind === 'raw_bytes',
+    )!;
+    assert.equal(
+      (await fs.readFile(artifactPath(root, raw))).toString('utf8'),
+      'data: earlier\n\ndata: later\n\n',
     );
-    const chunks = await readJsonLines(chunksFile);
-    assert.equal(chunks.length, 3);
-    assert.equal('dataBase64' in chunks[0], false);
-    assert.deepEqual(
-      chunks.map(chunk => [chunk.fileOffsetStart, chunk.fileOffsetEnd]),
-      [
-        [0, Buffer.byteLength(first)],
-        [
-          Buffer.byteLength(first),
-          Buffer.byteLength(first) + Buffer.byteLength(secondChunk),
-        ],
-        [
-          Buffer.byteLength(first) + Buffer.byteLength(secondChunk),
-          Buffer.byteLength(expected),
-        ],
-      ],
-    );
-    assert.equal(request.doneMarkerObserved, true);
-    assert.equal(request.writeErrors.length, 0);
   } finally {
     collector.dispose();
     await fs.rm(root, {recursive: true, force: true});
   }
 });
 
-test('incremental UTF-8 decoding preserves characters split across chunks', async () => {
-  const {root, outputDir} = await createOutputDir();
-  const {collector, page, session} = createFixture();
+test('loadingFinished before activation waits for bufferedData and pending chunks', async () => {
+  const activation = deferred<{bufferedData?: string}>();
+  const {collector, addPage} = createFixture({
+    streamResourceContent: () => activation.promise,
+  });
+  const control = addPage();
+  const {root, location} = await createLocation('finish-before-activation');
   try {
-    await collector.addPage(page);
-    const capture = collector.startCapture(page, {}, outputDir);
-    const requestId = emitRequestStart(session);
+    await collector.addPage(control.page);
+    const capture = await collector.startCapture(control.page, {}, location);
+    const requestId = emitRequestStart(control.session);
+    emitText(control.session, requestId, 'data: second\n\n', 3);
+    emitFinished(control.session, requestId, 4);
+    await flushMicrotasks();
+    assert.equal(capture.requests[0].status, 'activating');
+    activation.resolve({
+      bufferedData: Buffer.from('data: first\n\n').toString('base64'),
+    });
+    await collector.stopCapture(capture.id);
+    assert.equal(capture.requests[0].status, 'finished');
+    assert.equal(capture.requests[0].rawEventCount, 2);
+  } finally {
+    collector.dispose();
+    await fs.rm(root, {recursive: true, force: true});
+  }
+});
+
+test('stop before activation waits for bufferedData and finalizes metadata', async () => {
+  const activation = deferred<{bufferedData?: string}>();
+  const {collector, addPage} = createFixture({
+    streamResourceContent: () => activation.promise,
+  });
+  const control = addPage();
+  const {root, location} = await createLocation('stop-before-activation');
+  try {
+    await collector.addPage(control.page);
+    const capture = await collector.startCapture(control.page, {}, location);
+    emitRequestStart(control.session);
+    const stopPromise = collector.stopCapture(capture.id);
+    activation.resolve({
+      bufferedData: Buffer.from('data: captured-before-stop\n\n').toString(
+        'base64',
+      ),
+    });
+    const stopped = await stopPromise;
+    assert.equal(stopped.status, 'stopped');
+    assert.equal(stopped.requests[0].status, 'stopped');
+    const manifest = JSON.parse(
+      await fs.readFile(artifactPath(root, stopped.metadataArtifact), 'utf8'),
+    ) as {status: string; requests: Array<{rawEventCount: number}>};
+    assert.equal(manifest.status, 'stopped');
+    assert.equal(manifest.requests[0].rawEventCount, 1);
+  } finally {
+    collector.dispose();
+    await fs.rm(root, {recursive: true, force: true});
+  }
+});
+
+test('incremental UTF-8 decoder preserves characters split across chunks', async () => {
+  const {collector, addPage} = createFixture();
+  const control = addPage();
+  const {root, location} = await createLocation('utf8');
+  try {
+    await collector.addPage(control.page);
+    const capture = await collector.startCapture(control.page, {}, location);
+    const requestId = emitRequestStart(control.session);
     await flushMicrotasks();
     const bytes = Buffer.from('data: {"text":"你好"}\n\n', 'utf8');
     const split = bytes.indexOf(Buffer.from('你', 'utf8')) + 1;
-    emitBytes(session, requestId, bytes.subarray(0, split), 3);
-    emitBytes(session, requestId, bytes.subarray(split), 4);
-    session.emit('Network.loadingFinished', {
-      requestId,
-      timestamp: 5,
-      encodedDataLength: bytes.length,
-    });
-    const stopped = await collector.stopCapture(page, capture.id);
-    const eventsFile = stopped.requests[0].files.find(
-      file => file.kind === 'events',
-    )!.path;
-    const [event] = await readJsonLines(eventsFile);
+    emitBytes(control.session, requestId, bytes.subarray(0, split), 3);
+    emitBytes(control.session, requestId, bytes.subarray(split), 4);
+    emitFinished(control.session, requestId);
+    await collector.stopCapture(capture.id);
+    const eventsArtifact = capture.requests[0].artifacts.find(
+      artifact => artifact.kind === 'events',
+    )!;
+    const [event] = await readJsonLines(artifactPath(root, eventsArtifact));
     assert.deepEqual(event.dataJson, {text: '你好'});
   } finally {
     collector.dispose();
@@ -348,157 +423,187 @@ test('incremental UTF-8 decoding preserves characters split across chunks', asyn
   }
 });
 
-test('extracts large business Base64 into a payload artifact', async () => {
-  const {root, outputDir} = await createOutputDir();
-  const {collector, page, session} = createFixture();
+test('all strict large Base64 candidates become unique payload artifacts without previews', async () => {
+  const {collector, addPage} = createFixture();
+  const control = addPage();
+  const {root, location} = await createLocation('payloads');
   try {
-    await collector.addPage(page);
-    const capture = collector.startCapture(page, {}, outputDir);
-    const requestId = emitRequestStart(session);
+    await collector.addPage(control.page);
+    const capture = await collector.startCapture(control.page, {}, location);
+    const requestId = emitRequestStart(control.session);
     await flushMicrotasks();
-    const png = Buffer.alloc(5000);
-    Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]).copy(png);
-    const encoded = png.toString('base64');
+    const first = Buffer.alloc(5000, 1).toString('base64');
+    const second = Buffer.alloc(5000, 2).toString('base64');
     emitText(
-      session,
+      control.session,
       requestId,
-      `data: ${JSON.stringify({type: 'image', image: encoded})}\n\n`,
+      `data: ${JSON.stringify({'a/b': first, 'a~b': second})}\n\n`,
       3,
     );
-    session.emit('Network.loadingFinished', {
-      requestId,
-      timestamp: 4,
-      encodedDataLength: encoded.length,
-    });
-    const stopped = await collector.stopCapture(page, capture.id);
-    const request = stopped.requests[0];
-    const eventsFile = request.files.find(file => file.kind === 'events')!.path;
-    const [event] = await readJsonLines(eventsFile);
-    const dataJson = event.dataJson as {
-      type: string;
-      image: {$artifact: string; decodedBytes: number; mimeType: string};
-    };
-    assert.equal(dataJson.type, 'image');
-    assert.equal(dataJson.image.decodedBytes, png.length);
-    assert.equal(dataJson.image.mimeType, 'image/png');
-    assert.doesNotMatch(
-      JSON.stringify(event),
-      new RegExp(encoded.slice(0, 100)),
+    emitFinished(control.session, requestId);
+    await collector.stopCapture(capture.id);
+
+    const request = capture.requests[0];
+    const payloads = request.artifacts.filter(
+      artifact => artifact.kind === 'payload',
     );
-    const payloadFile = request.files.find(file => file.kind === 'payload');
-    assert.ok(payloadFile);
-    assert.deepEqual(await fs.readFile(payloadFile.path), png);
+    assert.equal(payloads.length, 2);
+    assert.notEqual(payloads[0].relativePath, payloads[1].relativePath);
+    assert.ok(payloads.every(artifact => artifact.writeStatus === 'written'));
+    const eventsArtifact = request.artifacts.find(
+      artifact => artifact.kind === 'events',
+    )!;
+    const serialized = await fs.readFile(
+      artifactPath(root, eventsArtifact),
+      'utf8',
+    );
+    assert.doesNotMatch(serialized, /preview/);
+    assert.doesNotMatch(serialized, new RegExp(first.slice(0, 80)));
+    assert.match(serialized, /detectionConfidence/);
   } finally {
     collector.dispose();
     await fs.rm(root, {recursive: true, force: true});
   }
 });
 
-test('writes native EventSource messages to a fallback JSONL file', async () => {
-  const {root, outputDir} = await createOutputDir();
-  const {collector, page, session} = createFixture({
-    streamResourceContent: async () => {
-      throw new Error('Method not found');
-    },
-  });
+test('disk quota failure is explicit and never reported as a normal finish', async () => {
+  const {collector, addPage} = createFixture({maxDiskBytesPerCapture: 40});
+  const control = addPage();
+  const {root, location} = await createLocation('quota');
   try {
-    await collector.addPage(page);
-    const capture = collector.startCapture(
-      page,
-      {resourceTypes: ['EventSource']},
-      outputDir,
+    await collector.addPage(control.page);
+    const capture = await collector.startCapture(control.page, {}, location);
+    const requestId = emitRequestStart(control.session);
+    await flushMicrotasks();
+    emitText(control.session, requestId, 'data: this-is-too-large\n\n', 3);
+    emitText(control.session, requestId, 'data: dropped-too\n\n', 4);
+    emitFinished(control.session, requestId, 5);
+    const stopped = await collector.stopCapture(capture.id);
+    const request = stopped.requests[0];
+    assert.equal(stopped.status, 'failed');
+    assert.equal(request.status, 'failed');
+    assert.equal(request.failure?.code, 'DISK_QUOTA_EXCEEDED');
+    assert.ok((request.truncation?.droppedChunkCount ?? 0) >= 1);
+    assert.ok((request.truncation?.droppedBytes ?? 0) > 0);
+  } finally {
+    collector.dispose();
+    await fs.rm(root, {recursive: true, force: true});
+  }
+});
+
+test('capture IDs are global and remain queryable after another page becomes active', async () => {
+  const {collector, addPage} = createFixture();
+  const firstPage = addPage('https://example.test/first');
+  const secondPage = addPage('https://example.test/second');
+  const firstLocation = await createLocation('first-page');
+  const secondLocation = await createLocation('second-page');
+  try {
+    await collector.addPage(firstPage.page);
+    await collector.addPage(secondPage.page);
+    const first = await collector.startCapture(
+      firstPage.page,
+      {},
+      firstLocation.location,
     );
-    const requestId = emitRequestStart(session, {
+    const second = await collector.startCapture(
+      secondPage.page,
+      {},
+      secondLocation.location,
+    );
+    assert.notEqual(first.id, second.id);
+    assert.equal(
+      collector.getById(first.id).pageUrl,
+      'https://example.test/first',
+    );
+    await collector.stopCapture(first.id);
+    assert.equal(collector.getById(first.id).status, 'stopped');
+    await collector.stopCapture(second.id);
+  } finally {
+    collector.dispose();
+    await fs.rm(firstLocation.root, {recursive: true, force: true});
+    await fs.rm(secondLocation.root, {recursive: true, force: true});
+  }
+});
+
+test('page close finalizes active capture and preserves its manifest', async () => {
+  const {collector, addPage} = createFixture();
+  const control = addPage();
+  const {root, location} = await createLocation('page-close');
+  try {
+    await collector.addPage(control.page);
+    const capture = await collector.startCapture(control.page, {}, location);
+    const requestId = emitRequestStart(control.session);
+    await flushMicrotasks();
+    emitText(control.session, requestId, 'data: before-close\n\n', 3);
+    control.close();
+    await collector.waitForPageCloseFinalization(control.page);
+    assert.equal(capture.status, 'failed');
+    assert.equal(capture.requests[0].status, 'failed');
+    assert.equal(capture.requests[0].failure?.code, 'PAGE_CLOSED');
+    const manifest = JSON.parse(
+      await fs.readFile(artifactPath(root, capture.metadataArtifact), 'utf8'),
+    ) as {status: string; requests: Array<{status: string}>};
+    assert.equal(manifest.status, 'failed');
+    assert.equal(manifest.requests[0].status, 'failed');
+  } finally {
+    collector.dispose();
+    await fs.rm(root, {recursive: true, force: true});
+  }
+});
+
+test('EventSource semantic mirror uses separate counts and raw remains primary', async () => {
+  const {collector, addPage} = createFixture();
+  const control = addPage();
+  const {root, location} = await createLocation('semantic-mirror');
+  try {
+    await collector.addPage(control.page);
+    const capture = await collector.startCapture(control.page, {}, location);
+    const requestId = emitRequestStart(control.session, {
       method: 'GET',
       type: 'EventSource',
     });
     await flushMicrotasks();
-    session.emit('Network.eventSourceMessageReceived', {
+    emitText(control.session, requestId, 'data: {"sequence":1}\n\n', 3);
+    control.session.emit('Network.eventSourceMessageReceived', {
       requestId,
       timestamp: 3,
       eventName: 'message',
       eventId: '1',
       data: '{"sequence":1}',
     });
-    session.emit('Network.eventSourceMessageReceived', {
-      requestId,
-      timestamp: 4,
-      eventName: 'done',
-      eventId: '2',
-      data: '[DONE]',
-    });
-    session.emit('Network.loadingFinished', {
-      requestId,
-      timestamp: 5,
-      encodedDataLength: 0,
-    });
-    const stopped = await collector.stopCapture(page, capture.id);
-    const request = stopped.requests[0];
-    const eventSourceFile = request.files.find(
-      file => file.kind === 'eventsource_events',
-    )!.path;
-    const events = await readJsonLines(eventSourceFile);
-    assert.equal(events.length, 2);
-    assert.equal(events[1].done, true);
-    assert.equal(request.eventCount, 0);
-    assert.equal(request.eventSourceMessageCount, 2);
-    assert.equal(request.doneMarkerObserved, true);
-    assert.match(request.streamResourceContentError ?? '', /Method not found/);
+    emitFinished(control.session, requestId, 4);
+    await collector.stopCapture(capture.id);
+    const request = capture.requests[0];
+    assert.equal(request.rawEventCount, 1);
+    assert.equal(request.semanticEventCount, 1);
+    assert.equal(request.primaryEventSource, 'raw-stream');
+    assert.equal(capture.rawEventCount, 1);
+    assert.equal(capture.semanticEventCount, 1);
   } finally {
     collector.dispose();
     await fs.rm(root, {recursive: true, force: true});
   }
 });
 
-test('records cancellation and freezes active requests on stop', async () => {
-  const {root, outputDir} = await createOutputDir();
-  const {collector, page, session} = createFixture();
+test('capture manifest contains only relative artifact paths', async () => {
+  const {collector, addPage} = createFixture();
+  const control = addPage();
+  const {root, location} = await createLocation('relative-paths');
   try {
-    await collector.addPage(page);
-    const capture = collector.startCapture(page, {}, outputDir);
-    const canceledRequestId = emitRequestStart(session, {
-      requestId: 'canceled',
-    });
-    await flushMicrotasks();
-    session.emit('Network.loadingFailed', {
-      requestId: canceledRequestId,
-      timestamp: 3,
-      type: 'Fetch',
-      errorText: 'net::ERR_ABORTED',
-      canceled: true,
-    });
-
-    const openRequestId = emitRequestStart(session, {requestId: 'open'});
-    await flushMicrotasks();
-    emitText(session, openRequestId, 'data: partial\n\n', 4);
-    const stopped = await collector.stopCapture(page, capture.id);
-
-    const canceled = stopped.requests.find(
-      item => item.requestId === 'canceled',
+    await collector.addPage(control.page);
+    const capture = await collector.startCapture(control.page, {}, location);
+    await collector.stopCapture(capture.id);
+    const manifestText = await fs.readFile(
+      artifactPath(root, capture.metadataArtifact),
+      'utf8',
     );
-    const open = stopped.requests.find(item => item.requestId === 'open');
-    assert.equal(canceled?.status, 'failed');
-    assert.equal(canceled?.failure?.canceled, true);
-    assert.equal(canceled?.failure?.errorText, 'net::ERR_ABORTED');
-    assert.equal(open?.status, 'stopped');
-    assert.equal(stopped.status, 'stopped');
+    assert.equal(manifestText.includes(root), false);
+    assert.match(
+      manifestText,
+      /captures\/relative-paths|captures\\relative-paths/,
+    );
   } finally {
     collector.dispose();
     await fs.rm(root, {recursive: true, force: true});
   }
-});
-
-test('disposing removes stream CDP listeners', async () => {
-  const {cdpHandlers, collector, page} = createFixture();
-  await collector.addPage(page);
-  assert.equal(cdpHandlers.get('Network.dataReceived')?.size, 1);
-  assert.equal(cdpHandlers.get('Network.eventSourceMessageReceived')?.size, 1);
-
-  collector.dispose();
-
-  assert.equal(cdpHandlers.get('Network.dataReceived')?.size ?? 0, 0);
-  assert.equal(
-    cdpHandlers.get('Network.eventSourceMessageReceived')?.size ?? 0,
-    0,
-  );
 });

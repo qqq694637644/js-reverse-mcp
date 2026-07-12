@@ -71,7 +71,7 @@ const SERVER_INSTRUCTIONS = `Use purpose-built tools for network, source, debugg
 
 For captured HTTP/API traffic, redirects, HTTP authentication flows, or cookie provenance, start with list_network_requests. To find where an exact cookie was created, refreshed, rotated, overwritten, or deleted—including HttpOnly, Secure, and SameSite cookies—call list_network_requests with cookieName. Then inspect the returned reqid or export outputPart="responseHeaders" for complete Set-Cookie values and attributes. Use get_request_initiator on a captured reqid to locate client-side JavaScript that initiated that request, if any. Initiator CDP data is not retroactive: if an older reqid has no initiator, reproduce the action after network capability is active and inspect the new reqid, or set break_on_xhr before reproduction. If runtime arguments or local variables are still needed, set break_on_xhr with a narrow URL substring, reproduce the request, inspect get_paused_info, optionally evaluate in the paused frame, and explicitly resume execution.
 
-For streaming HTTP responses such as fetch/XHR text/event-stream, call start_stream_capture with a new workspace output directory before reproducing the action. CDP Base64 is decoded inside the server and written as raw.bin, raw.sse, chunks.jsonl, events.jsonl, metadata, and extracted payload artifacts. Use get_stream_status only for small status, file paths, and optional chunk offsets; read or search the files with workspace tools. Finish with stop_stream_capture, and use export_stream_capture to flush metadata and return the file index. Ordinary response-body export may be unavailable after Chromium evicts a completed stream. Use get_websocket_messages for WebSocket frames rather than the HTTP upgrade request. WebSocket and stream capture are not retroactive.
+For streaming HTTP responses such as fetch/XHR text/event-stream, the application orchestrator should call start_stream_capture before reproducing the action and stop_stream_capture afterward. Stream tools require --allowedRoots; the server allocates a unique directory under the first allowed root and returns only root indexes, relative paths, opaque artifact IDs, status, and bounded recent metadata. CDP Base64 is decoded inside the server and written as raw.bin, raw.sse, chunks.jsonl, events.jsonl, metadata, and extracted payload artifacts. Use get_stream_status only for small status and bounded recent offsets; read or search the files with workspace tools mounted to the same allowed root. Ordinary response-body export may be unavailable after Chromium evicts a completed stream. Use get_websocket_messages for WebSocket frames rather than the HTTP upgrade request. WebSocket and stream capture are not retroactive.
 
 For code discovery, use search_in_sources when you know text and list_scripts when you do not; read a bounded region with get_script_source or save a complete/minified source with save_script_source. Select the correct page before page-scoped work. Select a frame for iframe-specific source, debugger, evaluate, or click work; network and cookie evidence is page-scoped and does not require frame selection. Prefer click_element for one known interaction. For code evaluation, clicks, deletion of state/evidence, or breakpoint removal, set confirm=true only when the user explicitly authorizes that specific effect; otherwise request confirmation.`;
 
@@ -122,7 +122,9 @@ async function getContext(): Promise<McpContext> {
 
   if (!context || context.browserContext !== result.context) {
     context?.dispose();
-    context = await McpContext.from(result.context, logger);
+    context = await McpContext.from(result.context, logger, {
+      streamMaxBytes: args.streamMaxBytes,
+    });
   }
   return context;
 }

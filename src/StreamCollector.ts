@@ -5,7 +5,7 @@
  */
 
 import {Buffer} from 'node:buffer';
-import {createHash} from 'node:crypto';
+import {createHash, randomUUID, type Hash} from 'node:crypto';
 import * as fs from 'node:fs/promises';
 import path from 'node:path';
 
@@ -13,15 +13,18 @@ import type {Protocol} from 'devtools-protocol';
 
 import {addCdpEventListener, removeCdpEventListener} from './CdpEvents.js';
 import type {CdpSessionProvider} from './CdpSessionProvider.js';
-import {logger} from './logger.js';
+import {logger, redactLogValue} from './logger.js';
 import type {BrowserContext, Page} from './third_party/index.js';
 
-export type StreamCaptureStatus = 'armed' | 'capturing' | 'stopped';
+export type StreamCaptureStatus = 'armed' | 'capturing' | 'stopped' | 'failed';
 export type StreamRequestStatus =
+  | 'activating'
   | 'streaming'
   | 'finished'
-  | 'failed'
-  | 'stopped';
+  | 'stopped'
+  | 'failed';
+export type StreamEventSource = 'raw-stream' | 'eventsource';
+export type StreamEventRecordType = 'event' | 'heartbeat';
 
 export interface StreamCaptureFilter {
   urlFilter?: string;
@@ -30,9 +33,34 @@ export interface StreamCaptureFilter {
   mimeTypes?: string[];
 }
 
-export interface StreamChunk {
+export interface StreamCaptureLocation {
+  rootIndex: number;
+  absoluteDir: string;
+  relativeDir: string;
+}
+
+export interface StreamArtifactFile {
+  artifactId: string;
+  kind:
+    | 'capture_metadata'
+    | 'request_metadata'
+    | 'raw_bytes'
+    | 'raw_text'
+    | 'chunks'
+    | 'events'
+    | 'eventsource_events'
+    | 'payload';
+  rootIndex: number;
+  relativePath: string;
+  bytes: number;
+  sha256?: string;
+  mimeType?: string;
+  writeStatus: 'pending' | 'written' | 'failed';
+  error?: string;
+}
+
+export interface StreamChunkOffset {
   index: number;
-  requestId: string;
   timestamp: number;
   dataLength: number;
   encodedDataLength: number;
@@ -43,30 +71,30 @@ export interface StreamChunk {
   eventIndexes: number[];
 }
 
-export interface StreamArtifactFile {
-  kind:
-    | 'capture_metadata'
-    | 'request_metadata'
-    | 'raw_bytes'
-    | 'raw_text'
-    | 'chunks'
-    | 'events'
-    | 'eventsource_events'
-    | 'payload';
-  path: string;
-  bytes?: number;
-  sha256?: string;
-  mimeType?: string;
-}
-
 export interface StreamEventSummary {
   index: number;
-  eventName: string;
+  recordType: StreamEventRecordType;
+  eventName?: string;
   done: boolean;
   timestamp?: number;
-  source: 'raw-stream' | 'eventsource';
+  source: StreamEventSource;
   dataLength: number;
   payloadCount: number;
+}
+
+export interface StreamTruncation {
+  truncatedAt: number;
+  reason: 'disk_quota_exceeded';
+  quotaBytes: number;
+  droppedChunkCount: number;
+  droppedBytes: number;
+}
+
+export interface StreamFailure {
+  errorText: string;
+  canceled: boolean;
+  blockedReason?: string;
+  code?: 'DISK_QUOTA_EXCEEDED' | 'PAGE_CLOSED' | 'STREAM_ERROR';
 }
 
 export interface StreamRequest {
@@ -79,41 +107,61 @@ export interface StreamRequest {
   status: StreamRequestStatus;
   startedAt: number;
   endedAt?: number;
-  failure?: {
-    errorText: string;
-    canceled: boolean;
-    blockedReason?: string;
-  };
+  failure?: StreamFailure;
   streamResourceContentEnabled: boolean;
   streamResourceContentError?: string;
-  outputDir: string;
-  chunks: StreamChunk[];
-  eventCount: number;
-  eventSourceMessageCount: number;
+  relativeDir: string;
+  chunkCount: number;
+  recentChunks: StreamChunkOffset[];
+  rawEventCount: number;
+  semanticEventCount: number;
+  primaryEventSource: StreamEventSource | 'none';
   doneMarkerObserved: boolean;
   parseErrors: number;
   incompleteTailChars: number;
-  totalBytes: number;
+  rawBytes: number;
+  diskBytesReserved: number;
+  truncation?: StreamTruncation;
   writeErrors: string[];
-  files: StreamArtifactFile[];
-  recentEvents: StreamEventSummary[];
+  artifacts: StreamArtifactFile[];
+  recentRawEvents: StreamEventSummary[];
+  recentSemanticEvents: StreamEventSummary[];
 }
 
 export interface StreamCapture {
   id: number;
   status: StreamCaptureStatus;
   filter: StreamCaptureFilter;
-  outputDir: string;
-  metadataFile: string;
+  artifactRootIndex: number;
+  relativeDir: string;
+  metadataArtifact: StreamArtifactFile;
+  pageUrl: string;
+  pageTitle?: string;
   createdAt: number;
   stoppedAt?: number;
   requests: StreamRequest[];
-  totalBytes: number;
-  totalChunks: number;
-  totalEvents: number;
-  truncated: boolean;
-  writeErrors: string[];
+  totalRawBytes: number;
+  diskBytesReserved: number;
+  chunkCount: number;
+  rawEventCount: number;
+  semanticEventCount: number;
+  quotaBytes: number;
+  truncation?: StreamTruncation;
+  errors: string[];
   version: number;
+}
+
+export interface SseEvent {
+  index: number;
+  recordType: StreamEventRecordType;
+  eventName?: string;
+  eventId?: string;
+  data: string;
+  retry?: number;
+  comments: string[];
+  done: boolean;
+  source: StreamEventSource;
+  timestamp?: number;
 }
 
 interface RequestMetadata {
@@ -124,18 +172,62 @@ interface RequestMetadata {
 
 interface StreamCollectorLimits {
   maxCaptures: number;
-  maxBytesPerCapture: number;
-  maxChunksPerCapture: number;
+  maxDiskBytesPerCapture: number;
+  maxRecentChunksPerRequest: number;
   maxRecentEventsPerRequest: number;
+}
+
+interface PendingChunk {
+  timestamp: number;
+  dataLength: number;
+  encodedDataLength: number;
+  payload: Buffer;
+  source: 'buffered' | 'network';
+}
+
+interface RequestTerminal {
+  status: 'finished' | 'stopped' | 'failed';
+  endedAt: number;
+  failure?: StreamFailure;
+}
+
+interface ArtifactRuntime {
+  descriptor: StreamArtifactFile;
+  absolutePath: string;
+  hash: Hash;
+}
+
+interface CaptureRuntime {
+  page: Page;
+  absoluteDir: string;
+  metadataAbsolutePath: string;
+  metadataChain: Promise<void>;
+  closePromise?: Promise<void>;
+}
+
+interface RequestRuntime {
+  capture: StreamCapture;
+  absoluteDir: string;
+  decoder: TextDecoder;
+  parser: IncrementalSseParser;
+  rawOffset: number;
+  payloadIndex: number;
+  nextSemanticEventIndex: number;
+  writeChain: Promise<void>;
+  activationPromise: Promise<void>;
+  activationResolved: boolean;
+  pendingChunks: PendingChunk[];
+  terminal?: RequestTerminal;
+  finalized: boolean;
+  finalizePromise?: Promise<void>;
+  artifacts: Map<StreamArtifactFile['kind'], ArtifactRuntime>;
 }
 
 interface MaterializedPayload {
   descriptor: Record<string, unknown>;
-  relativePath: string;
+  artifact: StreamArtifactFile;
   absolutePath: string;
   bytes: Buffer;
-  mimeType?: string;
-  sha256: string;
 }
 
 interface MaterializedEvent {
@@ -144,45 +236,13 @@ interface MaterializedEvent {
   summary: StreamEventSummary;
 }
 
-interface RequestRuntime {
-  writeChain: Promise<void>;
-  decoder: TextDecoder;
-  parser: IncrementalSseParser;
-  rawOffset: number;
-  finalized: boolean;
-  finalizePromise?: Promise<void>;
-}
-
-export interface SseEvent {
-  index: number;
-  eventName: string;
-  eventId?: string;
-  data: string;
-  retry?: number;
-  comments: string[];
-  raw: string;
-  done: boolean;
-  source: 'raw-stream' | 'eventsource';
-  timestamp?: number;
-}
-
-export const MAX_RETAINED_STREAM_CAPTURES = 20;
-export const MAX_RETAINED_STREAM_BYTES = 32 * 1024 * 1024;
-export const MAX_RETAINED_STREAM_CHUNKS = 20_000;
+export const DEFAULT_STREAM_DISK_QUOTA_BYTES = 512 * 1024 * 1024;
+export const MAX_RETAINED_STREAM_CAPTURES = 100;
+export const MAX_RECENT_STREAM_CHUNKS = 100;
 export const MAX_RECENT_STREAM_EVENTS = 20;
 
 const MAX_INLINE_EVENT_DATA_CHARS = 64 * 1024;
 const MIN_BASE64_ARTIFACT_CHARS = 4 * 1024;
-
-function createIdGenerator() {
-  let id = 1;
-  return () => {
-    if (id === Number.MAX_SAFE_INTEGER) {
-      id = 1;
-    }
-    return id++;
-  };
-}
 
 function normalizedList(values?: string[]): string[] | undefined {
   if (!values?.length) {
@@ -211,35 +271,37 @@ function matchesFilter(
     return false;
   }
   const mimeTypes = normalizedList(filter.mimeTypes);
-  if (
-    mimeTypes &&
-    !mimeTypes.some(expected =>
+  return (
+    !mimeTypes ||
+    mimeTypes.some(expected =>
       (mimeType ?? '').toLowerCase().startsWith(expected),
     )
-  ) {
-    return false;
-  }
-  return true;
+  );
 }
 
 function getErrorText(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
+  const message = error instanceof Error ? error.message : String(error);
+  return String(redactLogValue(message));
 }
 
-function toJsonLine(value: unknown): string {
-  return `${JSON.stringify(value)}\n`;
+function toJsonLine(value: unknown): Buffer {
+  return Buffer.from(`${JSON.stringify(value)}\n`, 'utf8');
+}
+
+function toPortablePath(value: string): string {
+  return value.split(path.sep).join('/');
 }
 
 function parseSseBlock(
   block: string,
   index: number,
-  source: SseEvent['source'],
+  source: StreamEventSource,
   timestamp?: number,
 ): SseEvent | undefined {
   const normalized = block.replaceAll('\r\n', '\n').replaceAll('\r', '\n');
   const dataLines: string[] = [];
   const comments: string[] = [];
-  let eventName = 'message';
+  let eventName: string | undefined;
   let eventId: string | undefined;
   let retry: number | undefined;
 
@@ -278,14 +340,16 @@ function parseSseBlock(
     return undefined;
   }
   const data = dataLines.join('\n');
+  const recordType: StreamEventRecordType =
+    dataLines.length === 0 && comments.length > 0 ? 'heartbeat' : 'event';
   return {
     index,
-    eventName,
+    recordType,
+    eventName: recordType === 'event' ? (eventName ?? 'message') : undefined,
     eventId,
     data,
     retry,
     comments,
-    raw: normalized,
     done: data.trim() === '[DONE]',
     source,
     timestamp,
@@ -399,13 +463,14 @@ function detectMimeType(data: Buffer): {mimeType?: string; extension: string} {
   return {extension: 'bin'};
 }
 
-function sanitizePathSegment(value: string): string {
-  return value.replaceAll(/[^a-zA-Z0-9_.-]+/g, '-').slice(0, 80) || 'data';
-}
-
-function parseBase64Candidate(
-  value: string,
-): {bytes: Buffer; mimeType?: string; extension: string} | undefined {
+function parseBase64Candidate(value: string):
+  | {
+      bytes: Buffer;
+      mimeType?: string;
+      extension: string;
+      confidence: 'high' | 'medium';
+    }
+  | undefined {
   let encoded = value;
   let declaredMimeType: string | undefined;
   const dataUri = /^data:([^;,]+)?;base64,(.*)$/s.exec(value);
@@ -425,70 +490,109 @@ function parseBase64Candidate(
   if (bytes.length === 0) {
     return undefined;
   }
+  const canonical = bytes.toString('base64').replaceAll(/=+$/g, '');
+  if (canonical !== compact.replaceAll(/=+$/g, '')) {
+    return undefined;
+  }
   const detected = detectMimeType(bytes);
   return {
     bytes,
     mimeType: declaredMimeType ?? detected.mimeType,
     extension: detected.extension,
+    confidence: dataUri || detected.mimeType ? 'high' : 'medium',
   };
+}
+
+function createArtifact(
+  capture: StreamCapture,
+  kind: StreamArtifactFile['kind'],
+  relativePath: string,
+  suffix: string,
+): StreamArtifactFile {
+  return {
+    artifactId: `stream-${capture.id}-${suffix}`,
+    kind,
+    rootIndex: capture.artifactRootIndex,
+    relativePath: toPortablePath(relativePath),
+    bytes: 0,
+    writeStatus: 'pending',
+  };
+}
+
+function atomicWriteFile(filename: string, data: Buffer): Promise<void> {
+  return (async () => {
+    const temporary = `${filename}.${randomUUID()}.tmp`;
+    await fs.writeFile(temporary, data, {flag: 'wx', mode: 0o600});
+    try {
+      await fs.rename(temporary, filename);
+    } catch (error) {
+      await fs.rm(temporary, {force: true}).catch(() => undefined);
+      throw error;
+    }
+  })();
 }
 
 function materializeJsonValue(
   value: unknown,
   keyPath: string[],
-  eventIndex: number,
-  eventSource: SseEvent['source'],
+  event: SseEvent,
   request: StreamRequest,
+  runtime: RequestRuntime,
   payloads: MaterializedPayload[],
 ): unknown {
   if (typeof value === 'string') {
     const candidate = parseBase64Candidate(value);
     if (!candidate) {
-      return value.length <= MAX_INLINE_EVENT_DATA_CHARS
-        ? value
-        : {
-            $largeText: true,
-            chars: value.length,
-            preview: value.slice(0, 512),
-            source: request.files.find(file => file.kind === 'raw_text')?.path,
-          };
-    }
-    const key = keyPath.at(-1) ?? 'data';
-    const explicitBinaryKey =
-      /(?:base64|b64|image|audio|blob|binary|file)/i.test(key);
-    const magicDetected = candidate.mimeType !== undefined;
-    if (!explicitBinaryKey && !magicDetected) {
+      if (value.length <= MAX_INLINE_EVENT_DATA_CHARS) {
+        return value;
+      }
       return {
-        $possibleBase64: true,
-        encodedChars: value.length,
-        decodedBytes: candidate.bytes.length,
-        preview: value.slice(0, 80),
-        source: request.files.find(file => file.kind === 'raw_text')?.path,
+        $largeText: true,
+        chars: value.length,
+        sha256: createHash('sha256').update(value, 'utf8').digest('hex'),
+        sourceArtifactId: request.artifacts.find(
+          file => file.kind === 'raw_text',
+        )?.artifactId,
       };
     }
+
+    const payloadIndex = runtime.payloadIndex++;
+    const pointer = `/${keyPath.map(item => item.replaceAll('~', '~0').replaceAll('/', '~1')).join('/')}`;
+    const pointerHash = createHash('sha256')
+      .update(pointer, 'utf8')
+      .digest('hex')
+      .slice(0, 12);
     const relativePath = path.join(
+      request.relativeDir,
       'payloads',
-      `event-${String(eventIndex).padStart(6, '0')}-${eventSource}-${sanitizePathSegment(keyPath.join('-'))}.${candidate.extension}`,
+      `payload-${String(payloadIndex).padStart(6, '0')}-${pointerHash}.${candidate.extension}`,
     );
-    const absolutePath = path.join(request.outputDir, relativePath);
-    const sha256 = createHash('sha256').update(candidate.bytes).digest('hex');
-    const descriptor: Record<string, unknown> = {
-      $artifact: relativePath,
-      encoding: 'base64',
-      decodedBytes: candidate.bytes.length,
-      sha256,
-    };
-    if (candidate.mimeType) {
-      descriptor.mimeType = candidate.mimeType;
-    }
-    payloads.push({
-      descriptor,
+    const capture = runtime.capture;
+    const artifact = createArtifact(
+      capture,
+      'payload',
       relativePath,
-      absolutePath,
-      bytes: candidate.bytes,
-      mimeType: candidate.mimeType,
-      sha256,
-    });
+      `request-${request.requestIndex + 1}-payload-${payloadIndex}`,
+    );
+    artifact.mimeType = candidate.mimeType;
+    artifact.bytes = candidate.bytes.length;
+    artifact.sha256 = createHash('sha256')
+      .update(candidate.bytes)
+      .digest('hex');
+    const absolutePath = path.join(
+      runtime.absoluteDir,
+      'payloads',
+      path.basename(relativePath),
+    );
+    const descriptor: Record<string, unknown> = {
+      $artifact: artifact,
+      encoding: 'base64',
+      encodedChars: value.length,
+      decodedBytes: candidate.bytes.length,
+      detectionConfidence: candidate.confidence,
+      jsonPointerSha256: pointerHash,
+    };
+    payloads.push({descriptor, artifact, absolutePath, bytes: candidate.bytes});
     return descriptor;
   }
   if (Array.isArray(value)) {
@@ -496,9 +600,9 @@ function materializeJsonValue(
       materializeJsonValue(
         item,
         [...keyPath, String(index)],
-        eventIndex,
-        eventSource,
+        event,
         request,
+        runtime,
         payloads,
       ),
     );
@@ -510,9 +614,9 @@ function materializeJsonValue(
         materializeJsonValue(
           item,
           [...keyPath, key],
-          eventIndex,
-          eventSource,
+          event,
           request,
+          runtime,
           payloads,
         ),
       ]),
@@ -524,10 +628,12 @@ function materializeJsonValue(
 function materializeEvent(
   event: SseEvent,
   request: StreamRequest,
+  runtime: RequestRuntime,
 ): MaterializedEvent {
   const payloads: MaterializedPayload[] = [];
   const record: Record<string, unknown> = {
     index: event.index,
+    recordType: event.recordType,
     eventName: event.eventName,
     eventId: event.eventId,
     retry: event.retry,
@@ -537,31 +643,33 @@ function materializeEvent(
     timestamp: event.timestamp,
     dataLength: event.data.length,
   };
-  try {
-    const parsed = JSON.parse(event.data) as unknown;
-    record.dataType = 'json';
-    record.dataJson = materializeJsonValue(
-      parsed,
-      ['data'],
-      event.index,
-      event.source,
-      request,
-      payloads,
-    );
-  } catch {
-    const materialized = materializeJsonValue(
-      event.data,
-      ['data'],
-      event.index,
-      event.source,
-      request,
-      payloads,
-    );
-    record.dataType = 'text';
-    if (typeof materialized === 'string') {
-      record.data = materialized;
-    } else {
-      record.dataArtifact = materialized;
+  if (event.recordType === 'event') {
+    try {
+      const parsed = JSON.parse(event.data) as unknown;
+      record.dataType = 'json';
+      record.dataJson = materializeJsonValue(
+        parsed,
+        ['data'],
+        event,
+        request,
+        runtime,
+        payloads,
+      );
+    } catch {
+      const materialized = materializeJsonValue(
+        event.data,
+        ['data'],
+        event,
+        request,
+        runtime,
+        payloads,
+      );
+      record.dataType = 'text';
+      if (typeof materialized === 'string') {
+        record.data = materialized;
+      } else {
+        record.dataArtifact = materialized;
+      }
     }
   }
   return {
@@ -569,6 +677,7 @@ function materializeEvent(
     payloads,
     summary: {
       index: event.index,
+      recordType: event.recordType,
       eventName: event.eventName,
       done: event.done,
       timestamp: event.timestamp,
@@ -579,34 +688,23 @@ function materializeEvent(
   };
 }
 
-async function writeJsonFile(filename: string, value: unknown): Promise<void> {
-  await fs.writeFile(filename, `${JSON.stringify(value, null, 2)}\n`, {
-    encoding: 'utf8',
-    mode: 0o600,
-  });
-}
-
-/**
- * Captures streaming HTTP response bytes without waiting for response.body().
- * Base64 from CDP is decoded immediately and never appears in tool output or
- * exported JSON. Raw bytes and analysis-friendly JSONL are written to disk.
- */
 export class StreamCollector {
   #context: BrowserContext;
   #sessionProvider: CdpSessionProvider;
   #limits: StreamCollectorLimits;
-  #storage = new WeakMap<Page, StreamCapture[]>();
-  #activeCapture = new WeakMap<Page, StreamCapture>();
-  #requestMetadata = new WeakMap<Page, Map<string, RequestMetadata>>();
-  #requestOwners = new WeakMap<Page, Map<string, StreamRequest>>();
+  #captures = new Map<number, StreamCapture>();
+  #captureRuntime = new WeakMap<StreamCapture, CaptureRuntime>();
+  #activeCaptureByPage = new WeakMap<Page, StreamCapture>();
   #requestRuntime = new WeakMap<StreamRequest, RequestRuntime>();
-  #requestCapture = new WeakMap<StreamRequest, StreamCapture>();
-  #idGenerators = new WeakMap<Page, () => number>();
+  #requestOwners = new WeakMap<Page, Map<string, StreamRequest>>();
+  #requestMetadata = new WeakMap<Page, Map<string, RequestMetadata>>();
   #cdpCleanup = new WeakMap<Page, () => void>();
   #pageCloseListeners = new WeakMap<Page, () => void>();
   #pageInitializations = new WeakMap<Page, Promise<void>>();
   #pendingInitializations = new Set<Promise<void>>();
+  #pageClosePromises = new WeakMap<Page, Promise<void>>();
   #initialization?: Promise<void>;
+  #nextCaptureId = 1;
   #listeningForPages = false;
   #disposed = false;
 
@@ -619,10 +717,10 @@ export class StreamCollector {
     this.#sessionProvider = sessionProvider;
     this.#limits = {
       maxCaptures: limits.maxCaptures ?? MAX_RETAINED_STREAM_CAPTURES,
-      maxBytesPerCapture:
-        limits.maxBytesPerCapture ?? MAX_RETAINED_STREAM_BYTES,
-      maxChunksPerCapture:
-        limits.maxChunksPerCapture ?? MAX_RETAINED_STREAM_CHUNKS,
+      maxDiskBytesPerCapture:
+        limits.maxDiskBytesPerCapture ?? DEFAULT_STREAM_DISK_QUOTA_BYTES,
+      maxRecentChunksPerRequest:
+        limits.maxRecentChunksPerRequest ?? MAX_RECENT_STREAM_CHUNKS,
       maxRecentEventsPerRequest:
         limits.maxRecentEventsPerRequest ?? MAX_RECENT_STREAM_EVENTS,
     };
@@ -655,22 +753,14 @@ export class StreamCollector {
     for (const page of this.#context.pages()) {
       void this.addPage(page).catch(() => undefined);
     }
-    await this.#drainInitializations();
-  }
-
-  async #drainInitializations(): Promise<void> {
-    let firstError: unknown;
     while (this.#pendingInitializations.size > 0) {
       const results = await Promise.allSettled([
         ...this.#pendingInitializations,
       ]);
       const rejection = results.find(result => result.status === 'rejected');
-      if (firstError === undefined && rejection?.status === 'rejected') {
-        firstError = rejection.reason;
+      if (rejection?.status === 'rejected') {
+        throw rejection.reason;
       }
-    }
-    if (firstError !== undefined) {
-      throw firstError;
     }
   }
 
@@ -704,17 +794,21 @@ export class StreamCollector {
   }
 
   async #initializePage(page: Page): Promise<void> {
-    this.#storage.set(page, []);
     this.#requestMetadata.set(page, new Map());
     this.#requestOwners.set(page, new Map());
-    this.#idGenerators.set(page, createIdGenerator());
-    const onClose = () => this.#cleanupPage(page);
+    const onClose = () => {
+      const closePromise = this.#handlePageClosed(page);
+      this.#pageClosePromises.set(page, closePromise);
+      void closePromise.catch(error => {
+        logger('Failed to finalize stream captures after page close', error);
+      });
+    };
     this.#pageCloseListeners.set(page, onClose);
     page.on('close', onClose);
     try {
       await this.#setupCdpListeners(page);
     } catch (error) {
-      this.#cleanupPage(page);
+      this.#removePageListeners(page);
       throw error;
     }
   }
@@ -740,8 +834,8 @@ export class StreamCollector {
     const onResponseReceived = (
       event: Protocol.Network.ResponseReceivedEvent,
     ): void => {
-      const capture = this.#activeCapture.get(page);
-      if (!capture || capture.status === 'stopped') {
+      const capture = this.#activeCaptureByPage.get(page);
+      if (!capture || !['armed', 'capturing'].includes(capture.status)) {
         return;
       }
       const metadata = metadataMap.get(event.requestId) ?? {
@@ -756,81 +850,24 @@ export class StreamCollector {
       if (ownerMap.has(event.requestId)) {
         return;
       }
-      const requestIndex = capture.requests.length;
-      const outputDir = path.join(
-        capture.outputDir,
-        `request-${String(requestIndex + 1).padStart(4, '0')}`,
+      const request = this.#createRequest(
+        capture,
+        metadata,
+        event.requestId,
+        event.response.mimeType,
+        event.timestamp * 1000,
       );
-      const files: StreamArtifactFile[] = [
-        {kind: 'request_metadata', path: path.join(outputDir, 'metadata.json')},
-        {kind: 'raw_bytes', path: path.join(outputDir, 'raw.bin')},
-        {kind: 'raw_text', path: path.join(outputDir, 'raw.sse')},
-        {kind: 'chunks', path: path.join(outputDir, 'chunks.jsonl')},
-        {kind: 'events', path: path.join(outputDir, 'events.jsonl')},
-        {
-          kind: 'eventsource_events',
-          path: path.join(outputDir, 'eventsource.jsonl'),
-        },
-      ];
-      const request: StreamRequest = {
-        requestId: event.requestId,
-        requestIndex,
-        url: metadata.url,
-        method: metadata.method,
-        resourceType: metadata.resourceType,
-        mimeType: event.response.mimeType,
-        status: 'streaming',
-        startedAt: event.timestamp * 1000,
-        streamResourceContentEnabled: false,
-        outputDir,
-        chunks: [],
-        eventCount: 0,
-        eventSourceMessageCount: 0,
-        doneMarkerObserved: false,
-        parseErrors: 0,
-        incompleteTailChars: 0,
-        totalBytes: 0,
-        writeErrors: [],
-        files,
-        recentEvents: [],
-      };
-      const runtime: RequestRuntime = {
-        writeChain: this.#initializeRequestFiles(request),
-        decoder: new TextDecoder('utf-8'),
-        parser: new IncrementalSseParser(),
-        rawOffset: 0,
-        finalized: false,
-      };
-      this.#requestRuntime.set(request, runtime);
-      this.#requestCapture.set(request, capture);
       ownerMap.set(event.requestId, request);
       capture.requests.push(request);
       capture.status = 'capturing';
       capture.version++;
-
-      void client
-        .send('Network.streamResourceContent', {requestId: event.requestId})
-        .then(result => {
-          request.streamResourceContentEnabled = true;
-          if (result.bufferedData) {
-            this.#addChunk(
-              page,
-              request,
-              {
-                requestId: event.requestId,
-                timestamp: event.timestamp,
-                dataLength: Buffer.from(result.bufferedData, 'base64').length,
-                encodedDataLength: 0,
-                data: result.bufferedData,
-              },
-              'buffered',
-            );
-          }
-        })
-        .catch(error => {
-          request.streamResourceContentError = getErrorText(error);
-          capture.version++;
-        });
+      const runtime = this.#requestRuntime.get(request)!;
+      runtime.activationPromise = this.#activateRequest(
+        client,
+        request,
+        runtime,
+        event.timestamp * 1000,
+      );
     };
 
     const onDataReceived = (
@@ -840,74 +877,80 @@ export class StreamCollector {
       if (!request) {
         return;
       }
-      this.#addChunk(page, request, event, 'network');
+      const runtime = this.#requestRuntime.get(request);
+      if (!runtime) {
+        return;
+      }
+      const chunk: PendingChunk = {
+        timestamp: event.timestamp * 1000,
+        dataLength: event.dataLength,
+        encodedDataLength: event.encodedDataLength,
+        payload: event.data
+          ? Buffer.from(event.data, 'base64')
+          : Buffer.alloc(0),
+        source: 'network',
+      };
+      if (!runtime.activationResolved) {
+        runtime.pendingChunks.push(chunk);
+        return;
+      }
+      this.#processChunk(request, runtime, chunk);
     };
 
     const onEventSourceMessage = (
       event: Protocol.Network.EventSourceMessageReceivedEvent,
     ): void => {
       const request = ownerMap.get(event.requestId);
-      if (!request) {
-        return;
-      }
-      const capture = this.#activeCapture.get(page);
-      if (!capture || capture.status === 'stopped') {
+      const runtime = request ? this.#requestRuntime.get(request) : undefined;
+      if (!request || !runtime) {
         return;
       }
       const semanticEvent: SseEvent = {
-        index: request.eventSourceMessageCount,
+        index: runtime.nextSemanticEventIndex++,
+        recordType: 'event',
         eventName: event.eventName || 'message',
         eventId: event.eventId || undefined,
         data: event.data,
         comments: [],
-        raw: '',
         done: event.data.trim() === '[DONE]',
         source: 'eventsource',
         timestamp: event.timestamp * 1000,
       };
-      request.eventSourceMessageCount++;
-      request.doneMarkerObserved ||= semanticEvent.done;
-      this.#enqueueEventWrite(request, semanticEvent, 'eventsource');
-      capture.version++;
+      this.#enqueueEventWrite(request, runtime, semanticEvent, 'semantic');
     };
 
     const onLoadingFinished = (
       event: Protocol.Network.LoadingFinishedEvent,
     ): void => {
-      const request = ownerMap.get(event.requestId);
       metadataMap.delete(event.requestId);
+      const request = ownerMap.get(event.requestId);
       if (!request) {
         return;
       }
-      request.status = 'finished';
-      request.endedAt = event.timestamp * 1000;
-      const capture = this.#activeCapture.get(page);
-      if (capture) {
-        capture.version++;
-      }
-      void this.#finalizeRequest(request);
+      this.#setTerminal(request, {
+        status: 'finished',
+        endedAt: event.timestamp * 1000,
+      });
     };
 
     const onLoadingFailed = (
       event: Protocol.Network.LoadingFailedEvent,
     ): void => {
-      const request = ownerMap.get(event.requestId);
       metadataMap.delete(event.requestId);
+      const request = ownerMap.get(event.requestId);
       if (!request) {
         return;
       }
-      request.status = 'failed';
-      request.endedAt = event.timestamp * 1000;
-      request.failure = {
-        errorText: event.errorText,
-        canceled: Boolean(event.canceled),
-        blockedReason: event.blockedReason,
-      };
-      const capture = this.#activeCapture.get(page);
-      if (capture) {
-        capture.version++;
-      }
-      void this.#finalizeRequest(request);
+      this.#setTerminal(request, {
+        status: 'failed',
+        endedAt: event.timestamp * 1000,
+        failure: {
+          errorText: event.errorText,
+          canceled: Boolean(event.canceled),
+          blockedReason: event.blockedReason,
+          code: 'STREAM_ERROR',
+        },
+      });
     };
 
     const cleanup = () => {
@@ -957,10 +1000,6 @@ export class StreamCollector {
       addCdpEventListener(client, 'Network.loadingFailed', onLoadingFailed);
       attached = true;
       await client.send('Network.enable');
-      if (!this.#storage.has(page)) {
-        cleanup();
-        return;
-      }
       this.#cdpCleanup.set(page, cleanup);
     } catch (error) {
       if (attached) {
@@ -970,149 +1009,441 @@ export class StreamCollector {
     }
   }
 
-  async #initializeRequestFiles(request: StreamRequest): Promise<void> {
-    await fs.mkdir(request.outputDir, {mode: 0o700});
-    await fs.mkdir(path.join(request.outputDir, 'payloads'), {mode: 0o700});
-    await Promise.all(
-      request.files
-        .filter(file => file.kind !== 'request_metadata')
-        .map(file =>
-          fs.writeFile(file.path, Buffer.alloc(0), {flag: 'wx', mode: 0o600}),
-        ),
+  #createRequest(
+    capture: StreamCapture,
+    metadata: RequestMetadata,
+    requestId: string,
+    mimeType: string,
+    startedAt: number,
+  ): StreamRequest {
+    const captureRuntime = this.#captureRuntime.get(capture)!;
+    const requestIndex = capture.requests.length;
+    const requestDirName = `request-${String(requestIndex + 1).padStart(4, '0')}`;
+    const relativeDir = toPortablePath(
+      path.join(capture.relativeDir, requestDirName),
     );
+    const absoluteDir = path.join(captureRuntime.absoluteDir, requestDirName);
+    const request: StreamRequest = {
+      requestId,
+      requestIndex,
+      url: metadata.url,
+      method: metadata.method,
+      resourceType: metadata.resourceType,
+      mimeType,
+      status: 'activating',
+      startedAt,
+      streamResourceContentEnabled: false,
+      relativeDir,
+      chunkCount: 0,
+      recentChunks: [],
+      rawEventCount: 0,
+      semanticEventCount: 0,
+      primaryEventSource: 'none',
+      doneMarkerObserved: false,
+      parseErrors: 0,
+      incompleteTailChars: 0,
+      rawBytes: 0,
+      diskBytesReserved: 0,
+      writeErrors: [],
+      artifacts: [],
+      recentRawEvents: [],
+      recentSemanticEvents: [],
+    };
+    const artifacts = this.#createRequestArtifacts(
+      capture,
+      request,
+      absoluteDir,
+    );
+    request.artifacts.push(
+      ...[...artifacts.values()].map(item => item.descriptor),
+    );
+    const runtime: RequestRuntime = {
+      capture,
+      absoluteDir,
+      decoder: new TextDecoder('utf-8'),
+      parser: new IncrementalSseParser(),
+      rawOffset: 0,
+      payloadIndex: 1,
+      nextSemanticEventIndex: 0,
+      writeChain: this.#initializeRequestFiles(absoluteDir, artifacts, request),
+      activationPromise: Promise.resolve(),
+      activationResolved: false,
+      pendingChunks: [],
+      finalized: false,
+      artifacts,
+    };
+    this.#requestRuntime.set(request, runtime);
+    return request;
   }
 
-  #queueWrite(request: StreamRequest, operation: () => Promise<void>): void {
-    const runtime = this.#requestRuntime.get(request);
-    if (!runtime) {
+  #createRequestArtifacts(
+    capture: StreamCapture,
+    request: StreamRequest,
+    absoluteDir: string,
+  ): Map<StreamArtifactFile['kind'], ArtifactRuntime> {
+    const result = new Map<StreamArtifactFile['kind'], ArtifactRuntime>();
+    const definitions: Array<[StreamArtifactFile['kind'], string, string]> = [
+      ['request_metadata', 'metadata.json', 'metadata'],
+      ['raw_bytes', 'raw.bin', 'raw'],
+      ['raw_text', 'raw.sse', 'text'],
+      ['chunks', 'chunks.jsonl', 'chunks'],
+      ['events', 'events.jsonl', 'events'],
+      ['eventsource_events', 'eventsource.jsonl', 'eventsource'],
+    ];
+    for (const [kind, filename, suffix] of definitions) {
+      const descriptor = createArtifact(
+        capture,
+        kind,
+        path.join(request.relativeDir, filename),
+        `request-${request.requestIndex + 1}-${suffix}`,
+      );
+      result.set(kind, {
+        descriptor,
+        absolutePath: path.join(absoluteDir, filename),
+        hash: createHash('sha256'),
+      });
+    }
+    return result;
+  }
+
+  async #initializeRequestFiles(
+    absoluteDir: string,
+    artifacts: Map<StreamArtifactFile['kind'], ArtifactRuntime>,
+    request: StreamRequest,
+  ): Promise<void> {
+    try {
+      await fs.mkdir(absoluteDir, {mode: 0o700});
+      await fs.mkdir(path.join(absoluteDir, 'payloads'), {mode: 0o700});
+      for (const artifact of artifacts.values()) {
+        if (artifact.descriptor.kind === 'request_metadata') {
+          continue;
+        }
+        await fs.writeFile(artifact.absolutePath, Buffer.alloc(0), {
+          flag: 'wx',
+          mode: 0o600,
+        });
+        artifact.descriptor.writeStatus = 'written';
+        artifact.descriptor.sha256 = artifact.hash.copy().digest('hex');
+      }
+    } catch (error) {
+      request.writeErrors.push(getErrorText(error));
+      for (const artifact of artifacts.values()) {
+        if (artifact.descriptor.writeStatus === 'pending') {
+          artifact.descriptor.writeStatus = 'failed';
+          artifact.descriptor.error = getErrorText(error);
+        }
+      }
+    }
+  }
+
+  async #activateRequest(
+    client: Awaited<ReturnType<CdpSessionProvider['getSession']>>,
+    request: StreamRequest,
+    runtime: RequestRuntime,
+    timestamp: number,
+  ): Promise<void> {
+    try {
+      const result = await client.send('Network.streamResourceContent', {
+        requestId: request.requestId,
+      });
+      request.streamResourceContentEnabled = true;
+      if (result.bufferedData) {
+        const payload = Buffer.from(result.bufferedData, 'base64');
+        this.#processChunk(request, runtime, {
+          timestamp,
+          dataLength: payload.length,
+          encodedDataLength: 0,
+          payload,
+          source: 'buffered',
+        });
+      }
+    } catch (error) {
+      request.streamResourceContentError = getErrorText(error);
+    } finally {
+      runtime.activationResolved = true;
+      request.status =
+        request.status === 'activating' ? 'streaming' : request.status;
+      for (const pending of runtime.pendingChunks) {
+        this.#processChunk(request, runtime, pending);
+      }
+      runtime.pendingChunks.length = 0;
+    }
+  }
+
+  #reserveDisk(
+    request: StreamRequest,
+    runtime: RequestRuntime,
+    bytes: number,
+    reason: string,
+    options: {droppedChunk?: boolean; droppedBytes?: number} = {},
+  ): boolean {
+    const capture = runtime.capture;
+    if (capture.diskBytesReserved + bytes <= capture.quotaBytes) {
+      capture.diskBytesReserved += bytes;
+      request.diskBytesReserved += bytes;
+      return true;
+    }
+    const now = Date.now();
+    const truncation = capture.truncation ?? {
+      truncatedAt: now,
+      reason: 'disk_quota_exceeded' as const,
+      quotaBytes: capture.quotaBytes,
+      droppedChunkCount: 0,
+      droppedBytes: 0,
+    };
+    capture.truncation = truncation;
+    request.truncation ??= {
+      ...truncation,
+      droppedChunkCount: 0,
+      droppedBytes: 0,
+    };
+    const droppedBytes = options.droppedBytes ?? bytes;
+    capture.truncation.droppedBytes += droppedBytes;
+    request.truncation.droppedBytes += droppedBytes;
+    if (options.droppedChunk) {
+      capture.truncation.droppedChunkCount++;
+      request.truncation.droppedChunkCount++;
+    }
+    capture.status = 'failed';
+    request.status = 'failed';
+    request.failure = {
+      errorText: `Stream capture disk quota exceeded while writing ${reason}`,
+      canceled: false,
+      code: 'DISK_QUOTA_EXCEEDED',
+    };
+    const page = this.#captureRuntime.get(capture)?.page;
+    if (page && this.#activeCaptureByPage.get(page) === capture) {
+      this.#activeCaptureByPage.delete(page);
+    }
+    return false;
+  }
+
+  #recordDroppedChunk(
+    request: StreamRequest,
+    runtime: RequestRuntime,
+    payloadBytes: number,
+  ): void {
+    const capture = runtime.capture;
+    const now = Date.now();
+    capture.truncation ??= {
+      truncatedAt: now,
+      reason: 'disk_quota_exceeded',
+      quotaBytes: capture.quotaBytes,
+      droppedChunkCount: 0,
+      droppedBytes: 0,
+    };
+    request.truncation ??= {
+      truncatedAt: now,
+      reason: 'disk_quota_exceeded',
+      quotaBytes: capture.quotaBytes,
+      droppedChunkCount: 0,
+      droppedBytes: 0,
+    };
+    capture.truncation.droppedChunkCount++;
+    capture.truncation.droppedBytes += payloadBytes;
+    request.truncation.droppedChunkCount++;
+    request.truncation.droppedBytes += payloadBytes;
+  }
+
+  #processChunk(
+    request: StreamRequest,
+    runtime: RequestRuntime,
+    pending: PendingChunk,
+  ): void {
+    if (runtime.finalized) {
       return;
     }
-    runtime.writeChain = runtime.writeChain.then(operation).catch(error => {
-      request.writeErrors.push(getErrorText(error));
+    if (runtime.capture.status === 'failed' && runtime.capture.truncation) {
+      this.#recordDroppedChunk(request, runtime, pending.payload.length);
+      return;
+    }
+
+    const decodedText = runtime.decoder.decode(pending.payload, {stream: true});
+    const parsedEvents = runtime.parser.push(decodedText, pending.timestamp);
+    const chunk: StreamChunkOffset = {
+      index: request.chunkCount,
+      timestamp: pending.timestamp,
+      dataLength: pending.dataLength,
+      encodedDataLength: pending.encodedDataLength,
+      payloadBytes: pending.payload.length,
+      source: pending.source,
+      fileOffsetStart: runtime.rawOffset,
+      fileOffsetEnd: runtime.rawOffset + pending.payload.length,
+      eventIndexes: parsedEvents.map(event => event.index),
+    };
+    const chunkLine = toJsonLine(chunk);
+    const textBytes = Buffer.byteLength(decodedText, 'utf8');
+    const requiredBytes = pending.payload.length + textBytes + chunkLine.length;
+    if (
+      !this.#reserveDisk(request, runtime, requiredBytes, 'stream chunk', {
+        droppedChunk: true,
+        droppedBytes: pending.payload.length,
+      })
+    ) {
+      return;
+    }
+
+    runtime.rawOffset += pending.payload.length;
+    request.rawBytes += pending.payload.length;
+    request.chunkCount++;
+    request.recentChunks.push(chunk);
+    if (request.recentChunks.length > this.#limits.maxRecentChunksPerRequest) {
+      request.recentChunks.splice(
+        0,
+        request.recentChunks.length - this.#limits.maxRecentChunksPerRequest,
+      );
+    }
+    runtime.capture.totalRawBytes += pending.payload.length;
+    runtime.capture.chunkCount++;
+    runtime.capture.version++;
+
+    this.#queueArtifactAppend(request, runtime, 'raw_bytes', pending.payload);
+    this.#queueArtifactAppend(
+      request,
+      runtime,
+      'raw_text',
+      Buffer.from(decodedText, 'utf8'),
+    );
+    this.#queueArtifactAppend(request, runtime, 'chunks', chunkLine);
+    for (const event of parsedEvents) {
+      this.#enqueueEventWrite(request, runtime, event, 'raw');
+    }
+  }
+
+  #queueArtifactAppend(
+    request: StreamRequest,
+    runtime: RequestRuntime,
+    kind: StreamArtifactFile['kind'],
+    data: Buffer,
+  ): void {
+    if (data.length === 0) {
+      return;
+    }
+    const artifact = runtime.artifacts.get(kind);
+    if (!artifact) {
+      request.writeErrors.push(`Missing ${kind} artifact`);
+      return;
+    }
+    runtime.writeChain = runtime.writeChain.then(async () => {
+      try {
+        await fs.appendFile(artifact.absolutePath, data);
+        artifact.hash.update(data);
+        artifact.descriptor.bytes += data.length;
+        artifact.descriptor.sha256 = artifact.hash.copy().digest('hex');
+        artifact.descriptor.writeStatus = 'written';
+      } catch (error) {
+        artifact.descriptor.writeStatus = 'failed';
+        artifact.descriptor.error = getErrorText(error);
+        request.writeErrors.push(
+          `Could not append ${kind}: ${getErrorText(error)}`,
+        );
+      }
     });
   }
 
   #enqueueEventWrite(
     request: StreamRequest,
+    runtime: RequestRuntime,
     event: SseEvent,
-    destination: 'events' | 'eventsource',
+    destination: 'raw' | 'semantic',
   ): void {
-    const materialized = materializeEvent(event, request);
-    request.doneMarkerObserved ||= event.done;
-    if (destination === 'events') {
-      request.eventCount++;
-    }
-    const capture = this.#requestCapture.get(request);
-    if (capture) {
-      capture.totalEvents++;
-    }
-    request.recentEvents.push(materialized.summary);
-    if (request.recentEvents.length > this.#limits.maxRecentEventsPerRequest) {
-      request.recentEvents.splice(
-        0,
-        request.recentEvents.length - this.#limits.maxRecentEventsPerRequest,
-      );
-    }
-    const targetKind =
-      destination === 'events' ? 'events' : 'eventsource_events';
-    const targetFile = request.files.find(
-      file => file.kind === targetKind,
-    )?.path;
-    if (!targetFile) {
-      request.writeErrors.push(`Missing ${targetKind} output file`);
+    const materialized = materializeEvent(event, request, runtime);
+    const targetKind: StreamArtifactFile['kind'] =
+      destination === 'raw' ? 'events' : 'eventsource_events';
+    const targetArtifact = runtime.artifacts.get(targetKind);
+    if (!targetArtifact) {
+      request.writeErrors.push(`Missing ${targetKind} artifact`);
       return;
     }
-    this.#queueWrite(request, async () => {
+    const estimatedRecordBytes =
+      Buffer.byteLength(JSON.stringify(materialized.record), 'utf8') + 1;
+    const payloadBytes = materialized.payloads.reduce(
+      (sum, payload) => sum + payload.bytes.length,
+      0,
+    );
+    if (
+      !this.#reserveDisk(
+        request,
+        runtime,
+        estimatedRecordBytes + payloadBytes,
+        'SSE event',
+      )
+    ) {
+      return;
+    }
+
+    runtime.writeChain = runtime.writeChain.then(async () => {
       for (const payload of materialized.payloads) {
-        await fs.writeFile(payload.absolutePath, payload.bytes, {
-          flag: 'wx',
-          mode: 0o600,
-        });
-        request.files.push({
-          kind: 'payload',
-          path: payload.absolutePath,
-          bytes: payload.bytes.length,
-          sha256: payload.sha256,
-          mimeType: payload.mimeType,
-        });
+        request.artifacts.push(payload.artifact);
+        try {
+          await fs.writeFile(payload.absolutePath, payload.bytes, {
+            flag: 'wx',
+            mode: 0o600,
+          });
+          payload.artifact.bytes = payload.bytes.length;
+          payload.artifact.sha256 = createHash('sha256')
+            .update(payload.bytes)
+            .digest('hex');
+          payload.artifact.writeStatus = 'written';
+          const descriptor = materialized.record;
+          void descriptor;
+        } catch (error) {
+          payload.artifact.writeStatus = 'failed';
+          payload.artifact.error = getErrorText(error);
+          request.writeErrors.push(
+            `Could not write payload ${payload.artifact.relativePath}: ${getErrorText(error)}`,
+          );
+        }
       }
-      await fs.appendFile(targetFile, toJsonLine(materialized.record), {
-        encoding: 'utf8',
-      });
+
+      try {
+        const line = toJsonLine(materialized.record);
+        await fs.appendFile(targetArtifact.absolutePath, line);
+        targetArtifact.hash.update(line);
+        targetArtifact.descriptor.bytes += line.length;
+        targetArtifact.descriptor.sha256 = targetArtifact.hash
+          .copy()
+          .digest('hex');
+        targetArtifact.descriptor.writeStatus = 'written';
+        if (destination === 'raw') {
+          request.rawEventCount++;
+          request.primaryEventSource = 'raw-stream';
+          runtime.capture.rawEventCount++;
+          request.recentRawEvents.push(materialized.summary);
+          this.#trimRecent(request.recentRawEvents);
+        } else {
+          request.semanticEventCount++;
+          runtime.capture.semanticEventCount++;
+          if (request.primaryEventSource === 'none') {
+            request.primaryEventSource = 'eventsource';
+          }
+          request.recentSemanticEvents.push(materialized.summary);
+          this.#trimRecent(request.recentSemanticEvents);
+        }
+        request.doneMarkerObserved ||= event.done;
+      } catch (error) {
+        targetArtifact.descriptor.writeStatus = 'failed';
+        targetArtifact.descriptor.error = getErrorText(error);
+        request.writeErrors.push(
+          `Could not write ${targetKind}: ${getErrorText(error)}`,
+        );
+      }
     });
   }
 
-  #addChunk(
-    page: Page,
-    request: StreamRequest,
-    event: {
-      requestId: string;
-      timestamp: number;
-      dataLength: number;
-      encodedDataLength: number;
-      data?: string;
-    },
-    source: StreamChunk['source'],
-  ): void {
-    const capture = this.#activeCapture.get(page);
+  #trimRecent(events: StreamEventSummary[]): void {
+    if (events.length > this.#limits.maxRecentEventsPerRequest) {
+      events.splice(0, events.length - this.#limits.maxRecentEventsPerRequest);
+    }
+  }
+
+  #setTerminal(request: StreamRequest, terminal: RequestTerminal): void {
     const runtime = this.#requestRuntime.get(request);
-    if (!capture || capture.status === 'stopped' || !runtime) {
+    if (!runtime || runtime.finalized) {
       return;
     }
-    const payload = event.data
-      ? Buffer.from(event.data, 'base64')
-      : Buffer.alloc(0);
-    const payloadBytes = payload.length;
-    if (
-      capture.totalChunks >= this.#limits.maxChunksPerCapture ||
-      capture.totalBytes + payloadBytes > this.#limits.maxBytesPerCapture
-    ) {
-      capture.truncated = true;
-      capture.version++;
-      return;
-    }
-
-    const decodedText = runtime.decoder.decode(payload, {stream: true});
-    const parsedEvents = runtime.parser.push(
-      decodedText,
-      event.timestamp * 1000,
-    );
-    const chunk: StreamChunk = {
-      index: request.chunks.length,
-      requestId: event.requestId,
-      timestamp: event.timestamp * 1000,
-      dataLength: event.dataLength,
-      encodedDataLength: event.encodedDataLength,
-      payloadBytes,
-      source,
-      fileOffsetStart: runtime.rawOffset,
-      fileOffsetEnd: runtime.rawOffset + payloadBytes,
-      eventIndexes: parsedEvents.map(item => item.index),
-    };
-    runtime.rawOffset += payloadBytes;
-    request.chunks.push(chunk);
-    request.totalBytes += payloadBytes;
-    capture.totalBytes += payloadBytes;
-    capture.totalChunks++;
-    capture.version++;
-
-    const rawFile = request.files.find(file => file.kind === 'raw_bytes')?.path;
-    const textFile = request.files.find(file => file.kind === 'raw_text')?.path;
-    const chunksFile = request.files.find(file => file.kind === 'chunks')?.path;
-    this.#queueWrite(request, async () => {
-      if (rawFile && payload.length > 0) {
-        await fs.appendFile(rawFile, payload);
-      }
-      if (textFile && decodedText.length > 0) {
-        await fs.appendFile(textFile, decodedText, {encoding: 'utf8'});
-      }
-      if (chunksFile) {
-        await fs.appendFile(chunksFile, toJsonLine(chunk), {encoding: 'utf8'});
-      }
-    });
-    for (const parsedEvent of parsedEvents) {
-      this.#enqueueEventWrite(request, parsedEvent, 'events');
-    }
+    runtime.terminal ??= terminal;
+    void this.#finalizeRequest(request);
   }
 
   async #finalizeRequest(request: StreamRequest): Promise<void> {
@@ -1125,42 +1456,90 @@ export class StreamCollector {
       return;
     }
     runtime.finalizePromise = (async () => {
-      if (!runtime.finalized) {
-        const finalText = runtime.decoder.decode();
-        const finalEvents = runtime.parser.push(finalText, request.endedAt);
-        request.incompleteTailChars = runtime.parser.incompleteTail.length;
-        const textFile = request.files.find(
-          file => file.kind === 'raw_text',
-        )?.path;
-        if (finalText.length > 0 && textFile) {
-          this.#queueWrite(request, () =>
-            fs.appendFile(textFile, finalText, {encoding: 'utf8'}),
+      try {
+        await runtime.activationPromise;
+        if (!runtime.finalized) {
+          const finalText = runtime.decoder.decode();
+          const finalEvents = runtime.parser.push(
+            finalText,
+            runtime.terminal?.endedAt,
           );
+          request.incompleteTailChars = runtime.parser.incompleteTail.length;
+          if (finalText.length > 0) {
+            const bytes = Buffer.from(finalText, 'utf8');
+            if (
+              this.#reserveDisk(
+                request,
+                runtime,
+                bytes.length,
+                'final UTF-8 decoder output',
+              )
+            ) {
+              this.#queueArtifactAppend(request, runtime, 'raw_text', bytes);
+            }
+          }
+          for (const event of finalEvents) {
+            this.#enqueueEventWrite(request, runtime, event, 'raw');
+          }
+          runtime.finalized = true;
         }
-        for (const event of finalEvents) {
-          this.#enqueueEventWrite(request, event, 'events');
-        }
-        runtime.finalized = true;
+        await runtime.writeChain;
+      } catch (error) {
+        request.writeErrors.push(`Finalize error: ${getErrorText(error)}`);
       }
-      await runtime.writeChain;
-      await this.#refreshArtifactMetadata(request);
-      await this.#writeRequestMetadata(request);
+
+      const terminal = runtime.terminal;
+      if (request.failure?.code !== 'DISK_QUOTA_EXCEEDED' && terminal) {
+        request.status = terminal.status;
+        request.endedAt = terminal.endedAt;
+        request.failure = terminal.failure;
+      } else if (!request.endedAt) {
+        request.endedAt = terminal?.endedAt ?? Date.now();
+      }
+
+      try {
+        await this.#writeRequestMetadata(request, runtime);
+      } catch (error) {
+        request.writeErrors.push(
+          `Could not write final request metadata: ${getErrorText(error)}`,
+        );
+        await this.#writeRequestMetadata(request, runtime).catch(
+          () => undefined,
+        );
+      }
+      await this.#queueCaptureMetadata(runtime.capture);
     })();
     await runtime.finalizePromise;
   }
 
-  async #writeRequestMetadata(request: StreamRequest): Promise<void> {
-    const metadataFile = request.files.find(
-      file => file.kind === 'request_metadata',
-    )?.path;
-    if (!metadataFile) {
+  async #writeRequestMetadata(
+    request: StreamRequest,
+    runtime: RequestRuntime,
+  ): Promise<void> {
+    const artifact = runtime.artifacts.get('request_metadata');
+    if (!artifact) {
       return;
     }
-    const primaryEventsFile =
-      request.eventCount > 0
-        ? request.files.find(file => file.kind === 'events')?.path
-        : request.files.find(file => file.kind === 'eventsource_events')?.path;
-    await writeJsonFile(metadataFile, {
+    const content = Buffer.from(
+      `${JSON.stringify(this.#requestManifest(request), null, 2)}\n`,
+      'utf8',
+    );
+    try {
+      await atomicWriteFile(artifact.absolutePath, content);
+      artifact.descriptor.bytes = content.length;
+      artifact.descriptor.sha256 = createHash('sha256')
+        .update(content)
+        .digest('hex');
+      artifact.descriptor.writeStatus = 'written';
+    } catch (error) {
+      artifact.descriptor.writeStatus = 'failed';
+      artifact.descriptor.error = getErrorText(error);
+      throw error;
+    }
+  }
+
+  #requestManifest(request: StreamRequest): Record<string, unknown> {
+    return {
       requestId: request.requestId,
       requestIndex: request.requestIndex,
       url: request.url,
@@ -1173,50 +1552,43 @@ export class StreamCollector {
       failure: request.failure,
       streamResourceContentEnabled: request.streamResourceContentEnabled,
       streamResourceContentError: request.streamResourceContentError,
-      chunkCount: request.chunks.length,
-      eventCount: request.eventCount,
-      eventSourceMessageCount: request.eventSourceMessageCount,
+      relativeDir: request.relativeDir,
+      chunkCount: request.chunkCount,
+      rawEventCount: request.rawEventCount,
+      semanticEventCount: request.semanticEventCount,
+      primaryEventSource: request.primaryEventSource,
       doneMarkerObserved: request.doneMarkerObserved,
       parseErrors: request.parseErrors,
       incompleteTailChars: request.incompleteTailChars,
-      totalBytes: request.totalBytes,
-      primaryEventsFile,
-      files: request.files,
+      rawBytes: request.rawBytes,
+      diskBytesReserved: request.diskBytesReserved,
+      truncation: request.truncation,
+      artifacts: request.artifacts,
       writeErrors: request.writeErrors,
-    });
+    };
   }
 
-  async #refreshArtifactMetadata(request: StreamRequest): Promise<void> {
-    for (const file of request.files) {
-      if (file.kind === 'request_metadata') {
-        continue;
-      }
-      try {
-        const data = await fs.readFile(file.path);
-        file.bytes = data.length;
-        file.sha256 = createHash('sha256').update(data).digest('hex');
-      } catch (error) {
-        request.writeErrors.push(
-          `Could not inspect artifact ${file.path}: ${getErrorText(error)}`,
-        );
-      }
-    }
-  }
-
-  async #writeCaptureMetadata(capture: StreamCapture): Promise<void> {
-    await writeJsonFile(capture.metadataFile, {
+  #captureManifest(capture: StreamCapture): Record<string, unknown> {
+    return {
       captureId: capture.id,
       status: capture.status,
       filter: capture.filter,
-      outputDir: capture.outputDir,
+      artifactRootIndex: capture.artifactRootIndex,
+      relativeDir: capture.relativeDir,
+      pageUrl: capture.pageUrl,
+      pageTitle: capture.pageTitle,
       createdAt: capture.createdAt,
       stoppedAt: capture.stoppedAt,
       requestCount: capture.requests.length,
-      totalBytes: capture.totalBytes,
-      totalChunks: capture.totalChunks,
-      totalEvents: capture.totalEvents,
-      truncated: capture.truncated,
-      writeErrors: capture.writeErrors,
+      totalRawBytes: capture.totalRawBytes,
+      diskBytesReserved: capture.diskBytesReserved,
+      metadataArtifact: capture.metadataArtifact,
+      chunkCount: capture.chunkCount,
+      rawEventCount: capture.rawEventCount,
+      semanticEventCount: capture.semanticEventCount,
+      quotaBytes: capture.quotaBytes,
+      truncation: capture.truncation,
+      errors: capture.errors,
       requests: capture.requests.map(request => ({
         requestId: request.requestId,
         requestIndex: request.requestIndex,
@@ -1225,37 +1597,74 @@ export class StreamCollector {
         resourceType: request.resourceType,
         mimeType: request.mimeType,
         status: request.status,
-        outputDir: request.outputDir,
-        chunkCount: request.chunks.length,
-        eventCount: request.eventCount,
-        eventSourceMessageCount: request.eventSourceMessageCount,
+        relativeDir: request.relativeDir,
+        chunkCount: request.chunkCount,
+        rawEventCount: request.rawEventCount,
+        semanticEventCount: request.semanticEventCount,
+        primaryEventSource: request.primaryEventSource,
         doneMarkerObserved: request.doneMarkerObserved,
-        totalBytes: request.totalBytes,
-        metadataFile: request.files.find(
-          file => file.kind === 'request_metadata',
-        )?.path,
+        rawBytes: request.rawBytes,
+        truncation: request.truncation,
+        metadataArtifactId: request.artifacts.find(
+          artifact => artifact.kind === 'request_metadata',
+        )?.artifactId,
+        artifacts: request.artifacts,
       })),
-    });
+    };
   }
 
-  startCapture(
+  #queueCaptureMetadata(capture: StreamCapture): Promise<void> {
+    const runtime = this.#captureRuntime.get(capture);
+    if (!runtime) {
+      return Promise.resolve();
+    }
+    runtime.metadataChain = runtime.metadataChain.then(async () => {
+      const content = Buffer.from(
+        `${JSON.stringify(this.#captureManifest(capture), null, 2)}\n`,
+        'utf8',
+      );
+      try {
+        await atomicWriteFile(runtime.metadataAbsolutePath, content);
+        capture.metadataArtifact.bytes = content.length;
+        capture.metadataArtifact.sha256 = createHash('sha256')
+          .update(content)
+          .digest('hex');
+        capture.metadataArtifact.writeStatus = 'written';
+      } catch (error) {
+        capture.metadataArtifact.writeStatus = 'failed';
+        capture.metadataArtifact.error = getErrorText(error);
+        capture.errors.push(
+          `Could not update capture metadata: ${getErrorText(error)}`,
+        );
+      }
+    });
+    return runtime.metadataChain;
+  }
+
+  async startCapture(
     page: Page,
     filter: StreamCaptureFilter,
-    outputDir: string,
-  ): StreamCapture {
-    const active = this.#activeCapture.get(page);
-    if (active && active.status !== 'stopped') {
+    location: StreamCaptureLocation,
+  ): Promise<StreamCapture> {
+    const active = this.#activeCaptureByPage.get(page);
+    if (active && ['armed', 'capturing'].includes(active.status)) {
       throw new Error(
         `Stream capture ${active.id} is already active for the selected page`,
       );
     }
-    const idGenerator = this.#idGenerators.get(page);
-    const storage = this.#storage.get(page);
-    if (!idGenerator || !storage) {
-      throw new Error('Stream collector is not initialized for selected page');
-    }
+    const id = this.#nextCaptureId++;
+    const metadataArtifact: StreamArtifactFile = {
+      artifactId: `stream-${id}-capture-metadata`,
+      kind: 'capture_metadata',
+      rootIndex: location.rootIndex,
+      relativePath: toPortablePath(
+        path.join(location.relativeDir, 'capture.json'),
+      ),
+      bytes: 0,
+      writeStatus: 'pending',
+    };
     const capture: StreamCapture = {
-      id: idGenerator(),
+      id,
       status: 'armed',
       filter: {
         ...filter,
@@ -1264,79 +1673,138 @@ export class StreamCollector {
             ? undefined
             : (filter.mimeTypes ?? ['text/event-stream']),
       },
-      outputDir,
-      metadataFile: path.join(outputDir, 'capture.json'),
+      artifactRootIndex: location.rootIndex,
+      relativeDir: toPortablePath(location.relativeDir),
+      metadataArtifact,
+      pageUrl: page.url(),
+      pageTitle: await page.title().catch(() => undefined),
       createdAt: Date.now(),
       requests: [],
-      totalBytes: 0,
-      totalChunks: 0,
-      totalEvents: 0,
-      truncated: false,
-      writeErrors: [],
+      totalRawBytes: 0,
+      diskBytesReserved: 0,
+      chunkCount: 0,
+      rawEventCount: 0,
+      semanticEventCount: 0,
+      quotaBytes: this.#limits.maxDiskBytesPerCapture,
+      errors: [],
       version: 0,
     };
-    storage.unshift(capture);
-    storage.splice(this.#limits.maxCaptures);
-    this.#activeCapture.set(page, capture);
-    this.#requestOwners.get(page)?.clear();
-    void this.#writeCaptureMetadata(capture).catch(error => {
-      capture.writeErrors.push(getErrorText(error));
+    this.#captures.set(id, capture);
+    this.#captureRuntime.set(capture, {
+      page,
+      absoluteDir: location.absoluteDir,
+      metadataAbsolutePath: path.join(location.absoluteDir, 'capture.json'),
+      metadataChain: Promise.resolve(),
     });
+    this.#activeCaptureByPage.set(page, capture);
+    this.#requestOwners.get(page)?.clear();
+    await this.#queueCaptureMetadata(capture);
+    this.#evictOldCaptures();
     return capture;
   }
 
-  async stopCapture(page: Page, captureId: number): Promise<StreamCapture> {
-    const capture = this.getById(page, captureId);
-    if (capture.status !== 'stopped') {
-      capture.status = 'stopped';
-      capture.stoppedAt = Date.now();
-      for (const request of capture.requests) {
-        if (request.status === 'streaming') {
-          request.status = 'stopped';
-          request.endedAt = capture.stoppedAt;
+  #evictOldCaptures(): void {
+    if (this.#captures.size <= this.#limits.maxCaptures) {
+      return;
+    }
+    for (const [id, capture] of this.#captures) {
+      const runtime = this.#captureRuntime.get(capture);
+      const active = runtime
+        ? this.#activeCaptureByPage.get(runtime.page) === capture
+        : false;
+      const settled = capture.requests.every(request => {
+        const requestRuntime = this.#requestRuntime.get(request);
+        return (
+          ['finished', 'stopped', 'failed'].includes(request.status) &&
+          requestRuntime?.finalized === true
+        );
+      });
+      if (
+        ['stopped', 'failed'].includes(capture.status) &&
+        settled &&
+        !active
+      ) {
+        this.#captures.delete(id);
+        if (this.#captures.size <= this.#limits.maxCaptures) {
+          break;
         }
       }
-      capture.version++;
-      if (this.#activeCapture.get(page) === capture) {
-        this.#activeCapture.delete(page);
-      }
-      this.#requestOwners.get(page)?.clear();
     }
-    await Promise.all(
-      capture.requests.map(request => this.#finalizeRequest(request)),
-    );
-    await this.#writeCaptureMetadata(capture);
-    return capture;
   }
 
-  async flushCapture(page: Page, captureId: number): Promise<StreamCapture> {
-    const capture = this.getById(page, captureId);
-    for (const request of capture.requests) {
-      const runtime = this.#requestRuntime.get(request);
-      if (runtime) {
-        await runtime.writeChain;
-      }
-      if (request.status !== 'streaming') {
-        await this.#finalizeRequest(request);
-      } else {
-        await this.#refreshArtifactMetadata(request);
-        await this.#writeRequestMetadata(request);
-      }
-    }
-    await this.#writeCaptureMetadata(capture);
-    return capture;
-  }
-
-  getData(page: Page): StreamCapture[] {
-    return this.#storage.get(page) ?? [];
-  }
-
-  getById(page: Page, captureId: number): StreamCapture {
-    const capture = this.getData(page).find(item => item.id === captureId);
+  getById(captureId: number): StreamCapture {
+    const capture = this.#captures.get(captureId);
     if (!capture) {
       throw new Error(`Stream capture ${captureId} was not found`);
     }
     return capture;
+  }
+
+  async stopCapture(captureId: number): Promise<StreamCapture> {
+    const capture = this.getById(captureId);
+    const runtime = this.#captureRuntime.get(capture);
+    if (!runtime) {
+      return capture;
+    }
+    if (!['stopped', 'failed'].includes(capture.status)) {
+      capture.status = 'stopped';
+      capture.stoppedAt = Date.now();
+    } else {
+      capture.stoppedAt ??= Date.now();
+    }
+    if (this.#activeCaptureByPage.get(runtime.page) === capture) {
+      this.#activeCaptureByPage.delete(runtime.page);
+    }
+    for (const request of capture.requests) {
+      const requestRuntime = this.#requestRuntime.get(request);
+      if (requestRuntime && !requestRuntime.terminal) {
+        requestRuntime.terminal = {
+          status: 'stopped',
+          endedAt: capture.stoppedAt,
+        };
+      }
+    }
+    await Promise.all(
+      capture.requests.map(request => this.#finalizeRequest(request)),
+    );
+    await this.#queueCaptureMetadata(capture);
+    return capture;
+  }
+
+  async #handlePageClosed(page: Page): Promise<void> {
+    const captures = [...this.#captures.values()].filter(
+      capture => this.#captureRuntime.get(capture)?.page === page,
+    );
+    for (const capture of captures) {
+      if (!['stopped', 'failed'].includes(capture.status)) {
+        capture.status = 'failed';
+        capture.stoppedAt = Date.now();
+        capture.errors.push('Owning page closed before capture was stopped.');
+      }
+      for (const request of capture.requests) {
+        const runtime = this.#requestRuntime.get(request);
+        if (runtime && !runtime.terminal) {
+          runtime.terminal = {
+            status: 'failed',
+            endedAt: capture.stoppedAt ?? Date.now(),
+            failure: {
+              errorText: 'Owning page closed during stream capture.',
+              canceled: false,
+              code: 'PAGE_CLOSED',
+            },
+          };
+        }
+      }
+      await Promise.all(
+        capture.requests.map(request => this.#finalizeRequest(request)),
+      );
+      await this.#queueCaptureMetadata(capture);
+    }
+    this.#removePageListeners(page);
+  }
+
+  async waitForPageCloseFinalization(page: Page): Promise<void> {
+    await this.#pageClosePromises.get(page);
   }
 
   dispose(): void {
@@ -1345,16 +1813,17 @@ export class StreamCollector {
       this.#context.off('page', this.#onPageCreated);
       this.#listeningForPages = false;
     }
-    for (const page of this.#context.pages()) {
-      const active = this.#activeCapture.get(page);
-      if (active) {
-        void this.stopCapture(page, active.id).catch(() => undefined);
+    for (const capture of this.#captures.values()) {
+      if (!['stopped', 'failed'].includes(capture.status)) {
+        void this.stopCapture(capture.id).catch(() => undefined);
       }
-      this.#cleanupPage(page);
+    }
+    for (const page of this.#context.pages()) {
+      this.#removePageListeners(page);
     }
   }
 
-  #cleanupPage(page: Page): void {
+  #removePageListeners(page: Page): void {
     const onClose = this.#pageCloseListeners.get(page);
     if (onClose) {
       page.off('close', onClose);
@@ -1367,12 +1836,10 @@ export class StreamCollector {
       } catch {
         // Page/session may already be closed.
       }
+      this.#cdpCleanup.delete(page);
     }
-    this.#cdpCleanup.delete(page);
-    this.#storage.delete(page);
-    this.#activeCapture.delete(page);
     this.#requestMetadata.delete(page);
     this.#requestOwners.delete(page);
-    this.#idGenerators.delete(page);
+    this.#activeCaptureByPage.delete(page);
   }
 }

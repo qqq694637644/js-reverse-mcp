@@ -2,7 +2,7 @@
 
 # Chrome DevTools MCP Tool Reference
 
-**Total: 28 tools.**
+**Total: 27 tools.**
 
 Every tool declares an MCP output schema. Successful calls and errors raised by
 tool handlers or runtime operations return `structuredContent` with a stable
@@ -18,9 +18,8 @@ content is kept for human-readable compatibility.
   - [`select_page`](#select_page)
 - **[Browser state](#browser-state)** (1 tool)
   - [`clear_site_data`](#clear_site_data)
-- **[Network](#network)** (7 tools)
+- **[Network](#network)** (6 tools)
   - [`clear_network_requests`](#clear_network_requests)
-  - [`export_stream_capture`](#export_stream_capture)
   - [`get_stream_status`](#get_stream_status)
   - [`get_websocket_messages`](#get_websocket_messages)
   - [`list_network_requests`](#list_network_requests)
@@ -122,28 +121,17 @@ content is kept for human-readable compatibility.
 
 ---
 
-### `export_stream_capture`
-
-**Description:** Flush current streaming evidence to disk and return only the artifact file index. Raw bytes, SSE text, JSONL events, chunk metadata, and extracted binary payloads are already stored under the capture output directory; this tool never returns their contents or Base64 through MCP.
-
-**Parameters:**
-
-- **captureId** (integer) **(required)**
-- **requestId** (string) _(optional)_: Optional requestId to return only files for one matched stream request.
-
----
-
 ### `get_stream_status`
 
-**Description:** Inspect small status and file-index metadata for a streaming capture. It never returns CDP Base64 or full SSE event bodies. Without requestId it lists matched requests. With requestId it returns request status, artifact paths, recent event summaries, and optionally paginated chunk offsets/timing. Read events.jsonl, raw.sse, or payload files with local workspace tools.
+**Description:** Inspect bounded status for a global stream capture ID, independent of the currently selected page. It returns capture/request summaries, workspace-relative artifact paths, bounded recent event summaries, and optionally bounded recent chunk offsets. It never returns event bodies, raw bytes, Base64, or operating-system absolute paths.
 
 **Parameters:**
 
 - **captureId** (integer) **(required)**
-- **includeChunks** (boolean) _(optional)_: Return paginated chunk timing and raw.bin byte offsets. Chunk payload bytes are never returned.
+- **includeRecentChunks** (boolean) _(optional)_
 - **pageIdx** (integer) _(optional)_
 - **pageSize** (integer) _(optional)_
-- **requestId** (string) _(optional)_: CDP requestId from the capture request list. Omit to list matched requests.
+- **requestId** (string) _(optional)_
 
 ---
 
@@ -187,13 +175,12 @@ content is kept for human-readable compatibility.
 
 ### `start_stream_capture`
 
-**Description:** Arm streaming HTTP response capture for the selected page before reproducing an action. CDP Base64 is decoded immediately and written under outputDir as raw bytes, decoded SSE text, chunk JSONL, event JSONL, metadata, and extracted binary payload files. The output directory must not already exist and is subject to --allowedRoots. No large Base64 or event body is returned through MCP.
+**Description:** Arm streaming HTTP capture for the selected page. The server requires --allowedRoots, allocates a globally unique directory under the first allowed root, decodes CDP Base64 internally, and returns only an opaque capture ID plus workspace-relative artifact metadata. Application code should orchestrate start, browser action, wait, and stop atomically; do not expose this sequence as separate user-managed GPT Actions.
 
 **Parameters:**
 
 - **methods** (array) _(optional)_: Optional HTTP method filter, such as ["POST"].
-- **mimeTypes** (array) _(optional)_: Response MIME prefixes to capture. Defaults to ["text/event-stream"]. Pass explicit values for NDJSON or another streaming format.
-- **outputDir** (string) **(required)**: New directory for capture files. It must not already exist and is subject to --allowedRoots.
+- **mimeTypes** (array) _(optional)_: Response MIME prefixes to capture. Defaults to ["text/event-stream"].
 - **resourceTypes** (array) _(optional)_: Optional CDP/Playwright resource-type filter, such as ["fetch","eventsource"].
 - **urlFilter** (string) _(optional)_: Only capture response URLs containing this substring.
 
@@ -201,7 +188,7 @@ content is kept for human-readable compatibility.
 
 ### `stop_stream_capture`
 
-**Description:** Stop an armed stream capture, flush incremental UTF-8/SSE parsing, and finalize request/capture metadata files. This does not cancel the browser request. Use after completion, failure, cancellation, or the desired partial-stream state has been observed.
+**Description:** Stop a global stream capture ID regardless of the currently selected page. The call waits for streamResourceContent activation, queued chunks, incremental parsing, artifact writes, and atomic metadata finalization. It returns the final capture summary plus a bounded artifact index; the complete index is in capture.json.
 
 **Parameters:**
 
@@ -433,6 +420,11 @@ content is kept for human-readable compatibility.
 - **`--allowedRoots`**
   Optional directories that local-file tools may read from or write to. Repeat the flag for multiple roots. Roots are resolved at startup and symlink escapes are rejected. While configured, file:, view-source:file:, and filesystem:file: browser pages are disabled. When omitted, local-file access is unrestricted and a security warning is printed.
   - **Type:** string[]
+
+- **`--streamMaxBytes`**
+  Maximum on-disk bytes reserved for one streaming-response capture. Defaults to 536870912 (512 MiB). Exceeding the quota marks the capture failed and records explicit truncation statistics.
+  - **Type:** number
+  - **Default:** `536870912`
 
 - **`--cloak`**
   Use CloakBrowser stealth-patched Chromium instead of system Chrome. Adds source-level fingerprint patches (canvas/WebGL/audio/GPU). Binary auto-downloads (~200MB) on first use. Identity is persisted per profile in <profile>/.cloak-seed.
