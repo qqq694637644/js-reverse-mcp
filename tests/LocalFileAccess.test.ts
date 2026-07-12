@@ -143,6 +143,25 @@ test('stream artifact root selector chooses an explicit allowed root', async () 
   }
 });
 
+test('backend namespace allocates capture inside an experiment directory', async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'mcp-experiment-root-'));
+  try {
+    configureAllowedRoots([root]);
+    const allocated = await allocateSecureArtifactDirectory('0', {
+      parentSegments: ['experiments', 'exp_001', 'js-reverse'],
+      prefix: 'capture',
+    });
+    const portable = allocated.relativeDir.split(path.sep).join('/');
+    assert.match(portable, /^experiments\/exp_001\/js-reverse\/capture-/);
+    assert.equal(
+      allocated.absoluteDir.startsWith(await fs.realpath(root)),
+      true,
+    );
+  } finally {
+    await fs.rm(root, {recursive: true, force: true});
+  }
+});
+
 test('stream artifact allocation rejects a symlink parent', async () => {
   const parent = await fs.mkdtemp(path.join(os.tmpdir(), 'mcp-stream-link-'));
   const root = path.join(parent, 'root');

@@ -223,15 +223,15 @@ List WebSocket connections, analyze message patterns, view messages of specific 
 
 ### SSE / Streaming HTTP Analysis
 
-Stream capture is not retroactive. Ordinary MCP mode exposes three lifecycle tools. GPT Action deployments should use `--toolExposureMode gpt-action` to hide them and let a downstream `runBrowserExperiment(capture_flow)` backend own the entire experiment in one call. See [docs/stream-capture-capability.md](docs/stream-capture-capability.md) for the full contract and completion matrix.
+Stream capture is not retroactive. MCP always registers the three lifecycle tools. `web_rev_action` should keep this MCP private, call it through an adapter allowlist, and expose only atomic `runBrowserExperiment(capture_flow)` to GPT. See [docs/stream-capture-capability.md](docs/stream-capture-capability.md).
 
 ```text
 1. Configure `--allowedRoots` for the shared Gateway workspace and select one root explicitly with `--streamArtifactRoot`
-2. An ordinary MCP client calls start_stream_capture; the server securely allocates a unique capture directory
+2. The backend calls start_stream_capture and may pass a constrained experiment namespace so evidence lands under `experiments/<namespace>/js-reverse/`
 3. The backend triggers the fetch/XHR/EventSource request inside the same experiment
 4. get_stream_status returns only status, counts, relative paths, and bounded recent chunk offsets
 5. stop_stream_capture awaits activation, pending chunks, and writes, then returns the final artifact index
-6. Use workspace file tools to read, search, and analyze events.jsonl or raw.sse
+6. Use workspace tools to analyze events.jsonl or decoded.sse; raw.bin remains the exact byte source
 ```
 
 ### Agent-Friendly Full Capture Flow
@@ -272,9 +272,10 @@ The CLI stays intentionally small and every flag is optional. Default behavior i
 | `--streamActivationTimeoutMs` | Internal timeout for `Network.streamResourceContent`; timeout creates a finalized failed manifest.                                                                                                                                                                                                    | `10000`     |
 | `--streamPendingMaxBytes`     | Maximum pending bytes retained in memory before activation completes. Exceeding it fails explicitly.                                                                                                                                                                                                  | `8388608`   |
 | `--streamMaxSseEventBytes`    | Semantic parser limit for one SSE event or incomplete tail. Raw evidence continues when parsing degrades.                                                                                                                                                                                             | `8388608`   |
-| `--toolExposureMode`          | `mcp` exposes three stream lifecycle primitives; `gpt-action` removes them from `tools/list`.                                                                                                                                                                                                         | `mcp`       |
 
 Streaming capture requires both `--allowedRoots` and `--streamArtifactRoot`. In a web integration, `js-reverse-mcp` and the Gateway workspace must see the same filesystem directory, or equivalent container volume mappings. MCP returns only an allowed-root index, workspace-relative paths, and opaque artifact IDs—not host absolute paths.
+
+Request snapshots keep ordinary headers, CDP ExtraInfo, UTF-8 `postData`, and explicit completeness metadata separately. They are not wire-level body bytes. Credential artifacts are marked `credential` and have separate redacted header artifacts for default reading.
 
 ### Example Configurations
 

@@ -19,7 +19,11 @@ import {
 } from './LocalFileAccess.js';
 import {NetworkCollector, ConsoleCollector} from './PageCollector.js';
 import type {ListenerMap, RequestInitiator} from './PageCollector.js';
-import type {StreamCapture, StreamCaptureFilter} from './StreamCollector.js';
+import type {
+  StreamCapture,
+  StreamCaptureFilter,
+  StreamCaptureOptions,
+} from './StreamCollector.js';
 import {StreamCollector} from './StreamCollector.js';
 import type {
   BrowserContext,
@@ -408,16 +412,21 @@ export class McpContext implements Context {
 
   async startStreamCapture(
     filter: StreamCaptureFilter,
+    options: StreamCaptureOptions & {artifactNamespace?: string} = {},
   ): Promise<StreamCapture> {
+    const parentSegments = options.artifactNamespace
+      ? ['experiments', options.artifactNamespace, 'js-reverse']
+      : ['js-reverse-streams'];
     const location = await allocateSecureArtifactDirectory(
       this.#streamArtifactRoot,
-      {parentName: 'js-reverse-streams', prefix: 'capture'},
+      {parentSegments, prefix: 'capture'},
     );
     try {
       return await this.#streamCollector.startCapture(
         this.getSelectedPage(),
         filter,
         location,
+        {includeInFlight: options.includeInFlight},
       );
     } catch (error) {
       await fs
@@ -431,8 +440,11 @@ export class McpContext implements Context {
     return this.#streamCollector.getById(captureId);
   }
 
-  async stopStreamCapture(captureId: number): Promise<StreamCapture> {
-    return this.#streamCollector.stopCapture(captureId);
+  async stopStreamCapture(
+    captureId: number,
+    options: {signal?: AbortSignal; deadlineWallTimeMs?: number} = {},
+  ): Promise<StreamCapture> {
+    return this.#streamCollector.stopCapture(captureId, options);
   }
 
   getDialog(): Dialog | undefined {

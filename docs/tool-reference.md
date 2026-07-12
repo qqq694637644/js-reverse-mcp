@@ -175,10 +175,12 @@ content is kept for human-readable compatibility.
 
 ### `start_stream_capture`
 
-**Description:** Ordinary MCP primitive that arms stream capture for the selected page. The deployment must configure --allowedRoots and --streamArtifactRoot; the server allocates the directory. In --toolExposureMode gpt-action this tool is hidden from tools/list because a downstream runBrowserExperiment(capture_flow) backend must own the entire start/action/wait/stop lifecycle.
+**Description:** MCP primitive that arms stream capture for the selected page. The deployment must configure --allowedRoots and --streamArtifactRoot; the server allocates the directory. A downstream GPT Action backend should call this private MCP tool from its own atomic runBrowserExperiment(capture_flow) implementation.
 
 **Parameters:**
 
+- **artifactNamespace** (string) _(optional)_: Optional backend-supplied experiment namespace. Artifacts are written under experiments/&lt;namespace&gt;/js-reverse/.
+- **includeInFlight** (boolean) _(optional)_: Include requests that started before this capture was armed.
 - **methods** (array) _(optional)_
 - **mimeTypes** (array) _(optional)_
 - **resourceTypes** (array) _(optional)_
@@ -188,11 +190,12 @@ content is kept for human-readable compatibility.
 
 ### `stop_stream_capture`
 
-**Description:** Ordinary MCP primitive that stops a global capture ID and waits for activation settlement, queued chunks, network snapshot artifacts, open-file writes, and atomic manifests. It returns only capture.json plus one request metadata artifact per request. In GPT Action deployments this tool is hidden and the backend invokes the collector internally.
+**Description:** MCP primitive that stops a global capture ID and waits for activation settlement, queued chunks, network snapshot artifacts, open-file writes, and atomic manifests. It returns only capture.json plus one request metadata artifact per request. A downstream Action backend should call it privately from one atomic capture_flow.
 
 **Parameters:**
 
 - **captureId** (integer) **(required)**
+- **finalizeTimeoutMs** (integer) _(optional)_
 
 ---
 
@@ -444,12 +447,6 @@ content is kept for human-readable compatibility.
   Maximum bytes retained by the semantic SSE parser for one event or incomplete tail. Raw capture continues after semantic parsing degrades. Defaults to 8388608 (8 MiB).
   - **Type:** number
   - **Default:** `8388608`
-
-- **`--toolExposureMode`**
-  Tool exposure profile. "mcp" exposes stream lifecycle primitives. "gpt-action" hides them from tools/list so a downstream Action can expose only one atomic capture_flow operation.
-  - **Type:** string
-  - **Choices:** `mcp`, `gpt-action`
-  - **Default:** `mcp`
 
 - **`--cloak`**
   Use CloakBrowser stealth-patched Chromium instead of system Chrome. Adds source-level fingerprint patches (canvas/WebGL/audio/GPU). Binary auto-downloads (~200MB) on first use. Identity is persisted per profile in <profile>/.cloak-seed.

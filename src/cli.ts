@@ -6,7 +6,6 @@
 
 import type {YargsOptions} from './third_party/index.js';
 import {yargs, hideBin} from './third_party/index.js';
-import {TOOL_EXPOSURE_MODES} from './toolRegistry.js';
 
 export const cliOptions = {
   browserUrl: {
@@ -102,13 +101,6 @@ export const cliOptions = {
       return value;
     },
   },
-  toolExposureMode: {
-    type: 'string',
-    choices: TOOL_EXPOSURE_MODES,
-    default: 'mcp',
-    description:
-      'Tool exposure profile. "mcp" exposes stream lifecycle primitives. "gpt-action" hides them from tools/list so a downstream Action can expose only one atomic capture_flow operation.',
-  },
   cloak: {
     type: 'boolean',
     description:
@@ -152,10 +144,6 @@ export function parseArguments(version: string, argv = process.argv) {
       [
         '$0 --allowedRoots /workspace --streamArtifactRoot 0',
         'Store stream artifacts under allowed root index 0',
-      ],
-      [
-        '$0 --toolExposureMode gpt-action',
-        'Hide stream lifecycle primitives from tools/list for GPT Action deployment',
       ],
       ['$0 --help', 'Print CLI options'],
     ]);

@@ -29,6 +29,7 @@ test('stream start schema does not accept a caller-provided output directory', (
     urlFilter: '/conversation',
     methods: ['POST'],
     resourceTypes: ['fetch'],
+    includeInFlight: false,
   });
   assert.throws(
     () =>
@@ -130,8 +131,14 @@ test('stop runtime validation returns only capture and request metadata artifact
   } as const;
   const capture = {
     id: 1,
+    uuid: '11111111-1111-4111-8111-111111111111',
     status: 'stopped',
     integrityStatus: 'complete',
+    collectorIntegrity: 'complete',
+    collectorGeneration: 1,
+    includeInFlight: false,
+    captureScope: 'page-target-only',
+    workerCoverage: false,
     filter: {mimeTypes: ['text/event-stream']},
     artifactRootIndex: 0,
     relativeDir: 'captures/one',
@@ -151,7 +158,7 @@ test('stop runtime validation returns only capture and request metadata artifact
   } as unknown as StreamCapture;
   let structured: Record<string, unknown> | undefined;
   await stopStreamCapture.handler(
-    {params: {captureId: 1}},
+    {params: {captureId: 1, finalizeTimeoutMs: 30_000}},
     {
       appendResponseLine: () => undefined,
       setStructuredContent: (value: Record<string, unknown>) => {

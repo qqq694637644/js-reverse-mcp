@@ -17,9 +17,6 @@ import * as streamTools from './tools/stream.js';
 import type {ToolDefinition} from './tools/ToolDefinition.js';
 import * as websocketTools from './tools/websocket.js';
 
-export const TOOL_EXPOSURE_MODES = ['mcp', 'gpt-action'] as const;
-export type ToolExposureMode = (typeof TOOL_EXPOSURE_MODES)[number];
-
 const allTools = [
   ...Object.values(consoleTools),
   ...Object.values(debuggerTools),
@@ -43,18 +40,6 @@ const allTools = [
   );
 }) as unknown as ToolDefinition[];
 
-/**
- * Ordinary MCP clients may coordinate the stream collector lifecycle directly.
- * GPT Action deployments must keep that lifecycle behind their own atomic
- * runBrowserExperiment/capture_flow operation, so stream lifecycle tools are
- * intentionally absent from tools/list in gpt-action mode.
- */
-export function getToolDefinitions(
-  mode: ToolExposureMode = 'mcp',
-): ToolDefinition[] {
-  const tools =
-    mode === 'gpt-action'
-      ? allTools.filter(tool => !tool.capabilities?.includes('stream'))
-      : [...allTools];
-  return tools.sort((a, b) => a.name.localeCompare(b.name));
+export function getToolDefinitions(): ToolDefinition[] {
+  return [...allTools].sort((a, b) => a.name.localeCompare(b.name));
 }

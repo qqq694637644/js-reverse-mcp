@@ -223,15 +223,15 @@ npm run build
 
 ### SSE / 流式 HTTP 分析
 
-流捕获不是追溯式的。普通 MCP 模式可使用三个生命周期工具；GPT Action 部署应使用 `--toolExposureMode gpt-action` 隐藏它们，由下游 `runBrowserExperiment(capture_flow)` 在一次后端调用中完成整个实验。完整设计和状态矩阵见 [docs/stream-capture-capability.md](docs/stream-capture-capability.md)。
+流捕获不是追溯式的。MCP 始终注册三个生命周期工具；`web_rev_action` 应把这个 MCP 保持为后端私有依赖，通过 adapter allowlist 调用，并只向 GPT 暴露原子的 `runBrowserExperiment(capture_flow)`。完整设计见 [docs/stream-capture-capability.md](docs/stream-capture-capability.md)。
 
 ```text
 1. 用 `--allowedRoots` 指向与 Gateway workspace 共享或映射的目录，并用 `--streamArtifactRoot` 明确选择其中一个 root
-2. 普通 MCP 客户端调用 start_stream_capture；服务端安全分配唯一 capture 目录
+2. 后端调用 start_stream_capture；可传受限的 experiment namespace，把目录归入 `experiments/<namespace>/js-reverse/`
 3. 后端在同一次实验中触发 fetch/XHR/EventSource 请求
 4. get_stream_status：只查看状态、计数、相对路径和最近 chunk offset
 5. stop_stream_capture：等待激活、pending chunk 和写队列，完成 manifest 并返回 artifact 索引
-6. 使用 workspace 文件工具读取、搜索和分析 events.jsonl / raw.sse
+6. 使用 workspace 文件工具读取、搜索和分析 events.jsonl / decoded.sse；精确字节始终以 raw.bin 为准
 ```
 
 ### Agent 推荐的完整捕获流程
@@ -272,9 +272,10 @@ CLI 保持精简，所有 flag 都是可选项。**99% 场景默认即可**。�
 | `--streamActivationTimeoutMs` | `Network.streamResourceContent` 的内部激活超时。超时会生成最终失败 manifest。                                                                                                                                             | `10000`     |
 | `--streamPendingMaxBytes`     | 激活期间允许保存在内存中的 pending chunk 总字节数。超过后立即失败并生成 manifest。                                                                                                                                        | `8388608`   |
 | `--streamMaxSseEventBytes`    | 单个 SSE 事件或未结束 tail 的语义解析上限；超过后保留 raw evidence，但语义解析标记 degraded。                                                                                                                             | `8388608`   |
-| `--toolExposureMode`          | `mcp` 暴露三个 stream 生命周期 primitive；`gpt-action` 从 `tools/list` 隐藏它们。                                                                                                                                         | `mcp`       |
 
 流捕获强制要求 `--allowedRoots` 和 `--streamArtifactRoot`。网页版集成中，`js-reverse-mcp` 与 Gateway workspace 必须看到同一个文件系统目录，或通过容器 volume 映射到相同内容；MCP 只返回 allowed-root 索引、workspace 相对路径和 opaque artifact ID，不返回宿主机绝对路径。
+
+请求快照会分别保存普通 headers、CDP ExtraInfo、UTF-8 `postData` 文本及其完整性说明。它不是 wire-level body。凭据文件标记为 `credential`，并同时生成默认可读的脱敏 headers artifact。
 
 ### 示例配置
 

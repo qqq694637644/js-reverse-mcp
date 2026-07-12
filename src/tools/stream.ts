@@ -48,6 +48,18 @@ const integritySchema = zod.enum([
   'partial',
   'failed',
 ]);
+const evidenceIntegritySchema = zod.enum([
+  'complete',
+  'partial',
+  'failed',
+  'not-attempted',
+]);
+const snapshotCompletenessSchema = zod.enum([
+  'complete',
+  'partial',
+  'none',
+  'unknown',
+]);
 const artifactSchema = zod
   .object({
     artifactId: zod.string().max(256),
@@ -55,13 +67,18 @@ const artifactSchema = zod
       'capture_metadata',
       'request_metadata',
       'raw_bytes',
-      'raw_text',
+      'decoded_text',
       'chunks',
       'events',
       'eventsource_events',
       'request_headers',
-      'request_body',
+      'request_headers_extra',
+      'request_headers_redacted',
+      'request_body_text',
+      'request_body_metadata',
       'response_headers',
+      'response_headers_extra',
+      'response_headers_redacted',
       'initiator',
       'redirects',
       'payload',
@@ -74,6 +91,11 @@ const artifactSchema = zod
       .regex(/^[a-f0-9]{64}$/)
       .optional(),
     mimeType: zod.string().max(256).optional(),
+    sensitivity: zod.enum(['public', 'private', 'credential']).optional(),
+    containsCredentials: zod.boolean().optional(),
+    encoding: zod.string().max(128).optional(),
+    captureSource: zod.string().max(128).optional(),
+    redactedArtifactId: zod.string().max(256).optional(),
     writeStatus: zod.enum(['pending', 'written', 'failed']),
     error: zod.string().max(4096).optional(),
   })
@@ -118,7 +140,7 @@ const eventSummarySchema = zod
     index: zod.number().int().nonnegative(),
     recordType: zod.enum(['event', 'heartbeat']),
     eventName: zod.string().max(256).optional(),
-    done: zod.boolean(),
+    defaultDoneMarker: zod.boolean(),
     source: zod.enum(['raw-stream', 'eventsource']),
     dataLength: zod.number().int().nonnegative(),
     payloadCount: zod.number().int().nonnegative(),
@@ -144,8 +166,15 @@ const chunkSchema = zod
 const captureSchema = zod
   .object({
     captureId: zod.number().int().positive(),
+    captureUuid: zod.string().uuid(),
     status: zod.enum(['armed', 'capturing', 'stopped', 'failed']),
     integrityStatus: integritySchema,
+    collectorIntegrity: integritySchema,
+    collectorGeneration: zod.number().int().nonnegative(),
+    captureArmedMonotonicTimeSeconds: zod.number().optional(),
+    includeInFlight: zod.boolean(),
+    captureScope: zod.literal('page-target-only'),
+    workerCoverage: zod.literal(false),
     artifactRootIndex: zod.number().int().nonnegative(),
     relativeDir: zod.string().max(4096),
     metadataArtifact: artifactSchema,
@@ -168,7 +197,22 @@ const captureSchema = zod
 const requestSchema = zod
   .object({
     cdpRequestId: zod.string().max(512),
+    persistentRequestId: zod.string().max(256),
     networkRequestId: zod.number().int().positive().optional(),
+    networkRequestIdLifetime: zod.literal('page-collector-generation'),
+    collectorGeneration: zod.number().int().nonnegative(),
+    requestStartedBeforeCapture: zod.boolean(),
+    responseObserved: zod.boolean(),
+    streamActivationAttempted: zod.boolean(),
+    failurePhase: zod
+      .enum(['before-response', 'activation', 'streaming', 'finalize'])
+      .optional(),
+    captureScope: zod.literal('page-target-only'),
+    workerCoverage: zod.literal(false),
+    targetType: zod.literal('page'),
+    frameId: zod.string().max(512).optional(),
+    loaderId: zod.string().max(512).optional(),
+    fromServiceWorker: zod.boolean().optional(),
     requestIndex: zod.number().int().nonnegative(),
     url: zod.string().max(8192),
     method: zod.string().max(32),
@@ -186,7 +230,7 @@ const requestSchema = zod
     terminalReason: zod
       .enum([
         'completed',
-        'user_cancel',
+        'network_canceled',
         'page_close',
         'network_error',
         'quota',
@@ -199,6 +243,13 @@ const requestSchema = zod
       ])
       .optional(),
     integrityStatus: integritySchema,
+    rawCaptureIntegrity: evidenceIntegritySchema,
+    semanticParseIntegrity: evidenceIntegritySchema,
+    requestSnapshotIntegrity: evidenceIntegritySchema,
+    artifactIntegrity: evidenceIntegritySchema,
+    headersCompleteness: snapshotCompletenessSchema,
+    bodyCompleteness: snapshotCompletenessSchema,
+    bodyCaptureSource: zod.enum(['cdp-postData-utf8', 'none', 'unavailable']),
     parseStatus: zod.enum(['complete', 'degraded', 'raw-only']),
     parseDegradedReason: zod.string().max(4096).optional(),
     startedMonotonicTimeSeconds: zod.number(),
@@ -213,7 +264,7 @@ const requestSchema = zod
     rawEventCount: zod.number().int().nonnegative(),
     semanticEventCount: zod.number().int().nonnegative(),
     primaryEventSource: zod.enum(['raw-stream', 'eventsource', 'none']),
-    doneMarkerObserved: zod.boolean(),
+    defaultDoneMarkerObserved: zod.boolean(),
     invalidUtf8Count: zod.number().int().nonnegative(),
     incompleteTailBytes: zod.number().int().nonnegative(),
     rawBytes: zod.number().int().nonnegative(),
@@ -315,8 +366,15 @@ function setValidatedData(
 function captureSummary(capture: StreamCapture) {
   return {
     captureId: capture.id,
+    captureUuid: capture.uuid,
     status: capture.status,
     integrityStatus: capture.integrityStatus,
+    collectorIntegrity: capture.collectorIntegrity,
+    collectorGeneration: capture.collectorGeneration,
+    captureArmedMonotonicTimeSeconds: capture.captureArmedMonotonicTimeSeconds,
+    includeInFlight: capture.includeInFlight,
+    captureScope: capture.captureScope,
+    workerCoverage: capture.workerCoverage,
     artifactRootIndex: capture.artifactRootIndex,
     relativeDir: capture.relativeDir,
     metadataArtifact: capture.metadataArtifact,
@@ -342,13 +400,18 @@ function coreArtifacts(request: StreamRequest): StreamArtifactFile[] {
     [
       'request_metadata',
       'raw_bytes',
-      'raw_text',
+      'decoded_text',
       'chunks',
       'events',
       'eventsource_events',
       'request_headers',
-      'request_body',
+      'request_headers_extra',
+      'request_headers_redacted',
+      'request_body_text',
+      'request_body_metadata',
       'response_headers',
+      'response_headers_extra',
+      'response_headers_redacted',
       'initiator',
       'redirects',
     ].includes(artifact.kind),
@@ -358,7 +421,20 @@ function coreArtifacts(request: StreamRequest): StreamArtifactFile[] {
 function requestSummary(request: StreamRequest) {
   return {
     cdpRequestId: request.cdpRequestId,
+    persistentRequestId: request.persistentRequestId,
     networkRequestId: request.networkRequestId,
+    networkRequestIdLifetime: request.networkRequestIdLifetime,
+    collectorGeneration: request.collectorGeneration,
+    requestStartedBeforeCapture: request.requestStartedBeforeCapture,
+    responseObserved: request.responseObserved,
+    streamActivationAttempted: request.streamActivationAttempted,
+    failurePhase: request.failurePhase,
+    captureScope: request.captureScope,
+    workerCoverage: request.workerCoverage,
+    targetType: request.targetType,
+    frameId: request.frameId,
+    loaderId: request.loaderId,
+    fromServiceWorker: request.fromServiceWorker,
     requestIndex: request.requestIndex,
     url: request.url,
     method: request.method,
@@ -368,6 +444,13 @@ function requestSummary(request: StreamRequest) {
     status: request.status,
     terminalReason: request.terminalReason,
     integrityStatus: request.integrityStatus,
+    rawCaptureIntegrity: request.rawCaptureIntegrity,
+    semanticParseIntegrity: request.semanticParseIntegrity,
+    requestSnapshotIntegrity: request.requestSnapshotIntegrity,
+    artifactIntegrity: request.artifactIntegrity,
+    headersCompleteness: request.headersCompleteness,
+    bodyCompleteness: request.bodyCompleteness,
+    bodyCaptureSource: request.bodyCaptureSource,
     parseStatus: request.parseStatus,
     parseDegradedReason: request.parseDegradedReason,
     startedMonotonicTimeSeconds: request.startedMonotonicTimeSeconds,
@@ -382,7 +465,7 @@ function requestSummary(request: StreamRequest) {
     rawEventCount: request.rawEventCount,
     semanticEventCount: request.semanticEventCount,
     primaryEventSource: request.primaryEventSource,
-    doneMarkerObserved: request.doneMarkerObserved,
+    defaultDoneMarkerObserved: request.defaultDoneMarkerObserved,
     invalidUtf8Count: request.invalidUtf8Count,
     incompleteTailBytes: request.incompleteTailBytes,
     rawBytes: request.rawBytes,
@@ -415,7 +498,7 @@ function paginate<T>(items: T[], pageIdx: number, pageSize: number) {
 export const startStreamCapture = defineTool({
   name: 'start_stream_capture',
   description:
-    'Ordinary MCP primitive that arms stream capture for the selected page. The deployment must configure --allowedRoots and --streamArtifactRoot; the server allocates the directory. In --toolExposureMode gpt-action this tool is hidden from tools/list because a downstream runBrowserExperiment(capture_flow) backend must own the entire start/action/wait/stop lifecycle.',
+    'MCP primitive that arms stream capture for the selected page. The deployment must configure --allowedRoots and --streamArtifactRoot; the server allocates the directory. A downstream GPT Action backend should call this private MCP tool from its own atomic runBrowserExperiment(capture_flow) implementation.',
   annotations: {
     title: 'Start Stream Capture',
     category: ToolCategory.NETWORK,
@@ -436,6 +519,18 @@ export const startStreamCapture = defineTool({
       .min(1)
       .max(32)
       .optional(),
+    artifactNamespace: zod
+      .string()
+      .regex(/^[a-zA-Z0-9_.-]+$/)
+      .max(128)
+      .optional()
+      .describe(
+        'Optional backend-supplied experiment namespace. Artifacts are written under experiments/<namespace>/js-reverse/.',
+      ),
+    includeInFlight: zod
+      .boolean()
+      .default(false)
+      .describe('Include requests that started before this capture was armed.'),
   },
   handler: async (request, response, context) => {
     const filter: StreamCaptureFilter = {
@@ -444,7 +539,10 @@ export const startStreamCapture = defineTool({
       resourceTypes: request.params.resourceTypes,
       mimeTypes: request.params.mimeTypes,
     };
-    const capture = await context.startStreamCapture(filter);
+    const capture = await context.startStreamCapture(filter, {
+      artifactNamespace: request.params.artifactNamespace,
+      includeInFlight: request.params.includeInFlight,
+    });
     const data = {capture: captureSummary(capture)};
     response.appendResponseLine(
       `Armed stream capture ${capture.id} under artifact root ${capture.artifactRootIndex} at ${capture.relativeDir}.`,
@@ -522,7 +620,7 @@ export const getStreamStatus = defineTool({
 export const stopStreamCapture = defineTool({
   name: 'stop_stream_capture',
   description:
-    'Ordinary MCP primitive that stops a global capture ID and waits for activation settlement, queued chunks, network snapshot artifacts, open-file writes, and atomic manifests. It returns only capture.json plus one request metadata artifact per request. In GPT Action deployments this tool is hidden and the backend invokes the collector internally.',
+    'MCP primitive that stops a global capture ID and waits for activation settlement, queued chunks, network snapshot artifacts, open-file writes, and atomic manifests. It returns only capture.json plus one request metadata artifact per request. A downstream Action backend should call it privately from one atomic capture_flow.',
   annotations: {
     title: 'Stop Stream Capture',
     category: ToolCategory.NETWORK,
@@ -535,9 +633,15 @@ export const stopStreamCapture = defineTool({
     captureMetadataArtifact: artifactSchema.optional(),
     requestMetadataArtifacts: zod.array(artifactSchema).max(200).optional(),
   }),
-  schema: {captureId: zod.number().int().positive()},
+  schema: {
+    captureId: zod.number().int().positive(),
+    finalizeTimeoutMs: zod.number().int().min(100).max(34_000).default(30_000),
+  },
   handler: async (request, response, context) => {
-    const capture = await context.stopStreamCapture(request.params.captureId);
+    const capture = await context.stopStreamCapture(request.params.captureId, {
+      signal: request.signal,
+      deadlineWallTimeMs: Date.now() + request.params.finalizeTimeoutMs,
+    });
     const requestMetadataArtifacts = capture.requests.flatMap(streamRequest => {
       const artifact = streamRequest.artifacts.find(
         item => item.kind === 'request_metadata',

@@ -159,31 +159,44 @@ async function assertDirectoryPathHasNoSymlink(
 
 export async function allocateSecureArtifactDirectory(
   selector: string | undefined,
-  options: {parentName?: string; prefix?: string} = {},
+  options: {
+    parentName?: string;
+    parentSegments?: string[];
+    prefix?: string;
+  } = {},
 ): Promise<SecureArtifactDirectory> {
   const {rootIndex, rootPath} = resolveAllowedRootSelector(selector);
-  const parentName = options.parentName ?? 'js-reverse-streams';
+  const parentSegments = options.parentSegments ?? [
+    options.parentName ?? 'js-reverse-streams',
+  ];
   const prefix = options.prefix ?? 'capture';
-  if (!/^[a-zA-Z0-9_.-]+$/.test(parentName)) {
-    throw new ToolError(
-      'INVALID_ARGUMENT',
-      'Stream artifact parentName contains unsupported characters.',
-    );
+  if (parentSegments.length === 0) {
+    throw new ToolError('INVALID_ARGUMENT', 'Artifact parent path is empty.');
   }
-  const parent = path.join(rootPath, parentName);
-  try {
-    await fsPromises.mkdir(parent, {mode: 0o700});
-  } catch (error) {
-    if (
-      typeof error !== 'object' ||
-      error === null ||
-      !('code' in error) ||
-      error.code !== 'EEXIST'
-    ) {
-      throw error;
+  let parent = rootPath;
+  for (const segment of parentSegments) {
+    if (!/^[a-zA-Z0-9_.-]+$/.test(segment)) {
+      throw new ToolError(
+        'INVALID_ARGUMENT',
+        `Artifact namespace segment contains unsupported characters: ${segment}`,
+      );
     }
+    const next = path.join(parent, segment);
+    try {
+      await fsPromises.mkdir(next, {mode: 0o700});
+    } catch (error) {
+      if (
+        typeof error !== 'object' ||
+        error === null ||
+        !('code' in error) ||
+        error.code !== 'EEXIST'
+      ) {
+        throw error;
+      }
+    }
+    parent = await assertDirectoryPathHasNoSymlink(rootPath, next);
   }
-  const realParent = await assertDirectoryPathHasNoSymlink(rootPath, parent);
+  const realParent = parent;
   const childName = `${prefix}-${Date.now()}-${randomUUID()}`;
   const candidate = path.join(realParent, childName);
   await fsPromises.mkdir(candidate, {mode: 0o700});

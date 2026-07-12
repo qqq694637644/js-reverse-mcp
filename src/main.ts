@@ -59,9 +59,7 @@ const VERSION = (
 
 function createServerInstructions(): string {
   const streamInstructions =
-    args.toolExposureMode === 'mcp'
-      ? 'For streaming HTTP responses such as fetch/XHR text/event-stream, ordinary MCP clients may coordinate start_stream_capture, the browser action, get_stream_status, and stop_stream_capture. Stream tools require --allowedRoots plus --streamArtifactRoot. CDP Base64 is decoded inside the server and written to workspace artifacts. The lifecycle is not retroactive.'
-      : 'This server is running in gpt-action exposure mode. Stream lifecycle tools are intentionally absent from tools/list. A downstream runBrowserExperiment(capture_flow) backend must call the internal collector atomically and expose only the final experiment manifest to GPT.';
+    'For streaming HTTP responses such as fetch/XHR text/event-stream, MCP clients may coordinate start_stream_capture, the browser action, get_stream_status, and stop_stream_capture. Stream tools require --allowedRoots plus --streamArtifactRoot. A higher-level GPT Action backend should keep this MCP server private and expose only its own atomic runBrowserExperiment(capture_flow) endpoint to GPT.';
   return `Use purpose-built tools for network, source, debugger, and browser-state evidence. Use evaluate_script directly for requested DOM/page state, web storage, page-defined globals, paused-frame expressions, or browser-side local-file processing when no narrower tool applies. Reuse returned IDs only within each tool's documented lifetime; prefer a script URL because scriptId expires on reload, navigation, or debugger frame/target change.
 
 For captured HTTP/API traffic, redirects, HTTP authentication flows, or cookie provenance, start with list_network_requests. To find where an exact cookie was created, refreshed, rotated, overwritten, or deleted—including HttpOnly, Secure, and SameSite cookies—call list_network_requests with cookieName. Then inspect the returned reqid or export outputPart="responseHeaders" for complete Set-Cookie values and attributes. Use get_request_initiator on a captured reqid to locate client-side JavaScript that initiated that request, if any. Initiator CDP data is not retroactive: if an older reqid has no initiator, reproduce the action after network capability is active and inspect the new reqid, or set break_on_xhr before reproduction. If runtime arguments or local variables are still needed, set break_on_xhr with a narrow URL substring, reproduce the request, inspect get_paused_info, optionally evaluate in the paused frame, and explicitly resume execution.
@@ -257,7 +255,7 @@ function registerTool(tool: ToolDefinition): void {
   );
 }
 
-const tools = getToolDefinitions(args.toolExposureMode as 'mcp' | 'gpt-action');
+const tools = getToolDefinitions();
 
 let shuttingDown = false;
 

@@ -204,6 +204,9 @@ function emitRequestStart(
       statusText: string;
       headers: Record<string, string>;
     };
+    emitResponse?: boolean;
+    frameId?: string;
+    loaderId?: string;
   } = {},
 ): string {
   const requestId = options.requestId ?? 'stream-1';
@@ -215,6 +218,8 @@ function emitRequestStart(
     timestamp: 1,
     wallTime: options.wallTime ?? 1_700_000_000,
     type,
+    frameId: options.frameId ?? 'frame-1',
+    loaderId: options.loaderId ?? 'loader-1',
     initiator: options.initiator ?? {type: 'script'},
     redirectResponse: options.redirectResponse,
     request: {
@@ -225,19 +230,101 @@ function emitRequestStart(
       hasPostData: options.hasPostData,
     },
   });
+  if (options.emitResponse !== false) {
+    emitResponse(session, requestId, {
+      url,
+      type,
+      mimeType: options.mimeType,
+      responseStatus: options.responseStatus,
+      responseStatusText: options.responseStatusText,
+      responseHeaders: options.responseHeaders,
+      frameId: options.frameId,
+      loaderId: options.loaderId,
+    });
+  }
+  return requestId;
+}
+
+function emitResponse(
+  session: MockSession,
+  requestId: string,
+  options: {
+    url?: string;
+    type?: string;
+    mimeType?: string;
+    responseStatus?: number;
+    responseStatusText?: string;
+    responseHeaders?: Record<string, string>;
+    frameId?: string;
+    loaderId?: string;
+    fromServiceWorker?: boolean;
+  } = {},
+): void {
   session.emit('Network.responseReceived', {
     requestId,
     timestamp: 2,
-    type,
+    type: options.type ?? 'Fetch',
+    frameId: options.frameId ?? 'frame-1',
+    loaderId: options.loaderId ?? 'loader-1',
     response: {
-      url,
+      url: options.url ?? 'https://example.test/api/stream',
       mimeType: options.mimeType ?? 'text/event-stream',
       status: options.responseStatus ?? 200,
       statusText: options.responseStatusText ?? 'OK',
       headers: options.responseHeaders ?? {'content-type': 'text/event-stream'},
+      fromServiceWorker: options.fromServiceWorker ?? false,
     },
   });
-  return requestId;
+}
+
+function emitRequestExtraInfo(
+  session: MockSession,
+  requestId: string,
+  headers: Record<string, string>,
+): void {
+  session.emit('Network.requestWillBeSentExtraInfo', {
+    requestId,
+    associatedCookies: [
+      {
+        cookie: {
+          name: 'session',
+          value: 'secret-cookie',
+          domain: 'example.test',
+          path: '/',
+          expires: -1,
+          size: 20,
+          httpOnly: true,
+          secure: true,
+          session: true,
+          priority: 'Medium',
+          sameParty: false,
+          sourceScheme: 'Secure',
+          sourcePort: 443,
+        },
+        blockedReasons: [],
+        exemptionReason: 'None',
+      },
+    ],
+    headers,
+    connectTiming: {requestTime: 1},
+    clientSecurityState: undefined,
+    siteHasCookieInOtherPartition: false,
+  });
+}
+
+function emitResponseExtraInfo(
+  session: MockSession,
+  requestId: string,
+  headers: Record<string, string>,
+): void {
+  session.emit('Network.responseReceivedExtraInfo', {
+    requestId,
+    blockedCookies: [],
+    headers,
+    resourceIPAddressSpace: 'Loopback',
+    statusCode: 200,
+    cookiePartitionKeyOpaque: false,
+  });
 }
 
 function emitBytes(
@@ -342,7 +429,7 @@ test('parseSseEvents distinguishes heartbeat records and preserves DONE', () => 
       recordType: event.recordType,
       eventName: event.eventName,
       data: event.data,
-      done: event.done,
+      done: event.defaultDoneMarker,
     })),
     [
       {
@@ -440,7 +527,7 @@ test('stop interrupts an unfinished activation and still finalizes metadata', as
     const capture = await collector.startCapture(control.page, {}, location);
     emitRequestStart(control.session);
     const stopped = await collector.stopCapture(capture.id);
-    assert.equal(stopped.status, 'failed');
+    assert.equal(stopped.status, 'stopped');
     assert.equal(stopped.requests[0].status, 'failed');
     assert.equal(stopped.requests[0].integrityStatus, 'failed');
     assert.equal(stopped.requests[0].terminalReason, 'collector_stop');
@@ -450,7 +537,7 @@ test('stop interrupts an unfinished activation and still finalizes metadata', as
       status: string;
       requests: Array<{status: string; integrityStatus: string}>;
     };
-    assert.equal(manifest.status, 'failed');
+    assert.equal(manifest.status, 'stopped');
     assert.equal(manifest.requests[0].integrityStatus, 'failed');
   } finally {
     collector.dispose();
@@ -805,9 +892,11 @@ test('user cancellation is a distinct terminal state', async () => {
     await collector.stopCapture(capture.id);
     const request = capture.requests[0];
     assert.equal(request.status, 'canceled');
-    assert.equal(request.terminalReason, 'user_cancel');
+    assert.equal(request.terminalReason, 'network_canceled');
     assert.equal(request.failure, undefined);
-    assert.equal(request.integrityStatus, 'complete');
+    assert.equal(request.rawCaptureIntegrity, 'complete');
+    assert.equal(request.requestSnapshotIntegrity, 'partial');
+    assert.equal(request.integrityStatus, 'partial');
   } finally {
     await collector.dispose();
     await fs.rm(root, {recursive: true, force: true});
@@ -856,7 +945,10 @@ test('request replay snapshot contains headers, body, response, initiator, redir
     ) as Record<string, string>;
     assert.equal(headers.authorization, 'Bearer local-test');
     assert.equal(
-      await fs.readFile(artifactPath(root, byKind('request_body')), 'utf8'),
+      await fs.readFile(
+        artifactPath(root, byKind('request_body_text')),
+        'utf8',
+      ),
       '{"from":"cdp"}',
     );
     const response = JSON.parse(
@@ -1028,7 +1120,7 @@ test('async dispose waits for active capture finalization', async () => {
     const capture = await collector.startCapture(control.page, {}, location);
     emitRequestStart(control.session);
     await collector.dispose({timeoutMs: 500, reason: 'test shutdown'});
-    assert.equal(capture.status, 'failed');
+    assert.equal(capture.status, 'stopped');
     assert.equal(capture.requests[0].status, 'failed');
     await fs.stat(artifactPath(root, capture.metadataArtifact));
   } finally {
@@ -1102,6 +1194,275 @@ test('payload and artifact limits omit extra payloads without leaking Base64', a
     const text = await fs.readFile(artifactPath(root, events), 'utf8');
     assert.match(text, /\$payloadOmitted/);
     assert.doesNotMatch(text, new RegExp(second.slice(0, 80)));
+  } finally {
+    await collector.dispose();
+    await fs.rm(root, {recursive: true, force: true});
+  }
+});
+
+test('stopped capture remains immutable after its page closes', async () => {
+  const {collector, addPage} = createFixture();
+  const control = addPage();
+  const {root, location} = await createLocation('immutable-after-stop');
+  try {
+    await collector.addPage(control.page);
+    const capture = await collector.startCapture(control.page, {}, location);
+    const requestId = emitRequestStart(control.session);
+    await flushMicrotasks();
+    emitText(control.session, requestId, 'data: [DONE]\n\n', 3);
+    emitFinished(control.session, requestId, 4);
+    await collector.stopCapture(capture.id);
+    const manifestPath = artifactPath(root, capture.metadataArtifact);
+    const before = await fs.readFile(manifestPath);
+    const beforeHash = capture.metadataArtifact.sha256;
+    assert.equal(capture.status, 'stopped');
+
+    control.close();
+    await collector.waitForPageCloseFinalization(control.page);
+
+    const after = await fs.readFile(manifestPath);
+    assert.equal(capture.status, 'stopped');
+    assert.equal(capture.metadataArtifact.sha256, beforeHash);
+    assert.deepEqual(after, before);
+  } finally {
+    await collector.dispose();
+    await fs.rm(root, {recursive: true, force: true});
+  }
+});
+
+test('matched request that fails before response still produces evidence', async () => {
+  const {collector, addPage} = createFixture();
+  const control = addPage();
+  const {root, location} = await createLocation('failure-before-response');
+  try {
+    await collector.addPage(control.page);
+    const capture = await collector.startCapture(
+      control.page,
+      {urlFilter: '/api/stream', methods: ['POST']},
+      location,
+    );
+    const requestId = emitRequestStart(control.session, {emitResponse: false});
+    emitFailed(control.session, requestId, {
+      timestamp: 2,
+      canceled: false,
+      errorText: 'net::ERR_CONNECTION_REFUSED',
+    });
+    await collector.stopCapture(capture.id);
+    assert.equal(capture.requests.length, 1);
+    const request = capture.requests[0];
+    assert.equal(request.responseObserved, false);
+    assert.equal(request.streamActivationAttempted, false);
+    assert.equal(request.failurePhase, 'before-response');
+    assert.equal(request.status, 'failed');
+    assert.equal(request.terminalReason, 'network_error');
+    assert.equal(request.rawCaptureIntegrity, 'not-attempted');
+    assert.equal(request.requestSnapshotIntegrity, 'partial');
+    await fs.stat(
+      artifactPath(
+        root,
+        request.artifacts.find(
+          artifact => artifact.kind === 'request_metadata',
+        )!,
+      ),
+    );
+  } finally {
+    await collector.dispose();
+    await fs.rm(root, {recursive: true, force: true});
+  }
+});
+
+test('pre-arm requests are excluded unless includeInFlight is enabled', async () => {
+  const {collector, addPage} = createFixture();
+  const control = addPage();
+  const firstLocation = await createLocation('pre-arm-excluded');
+  const secondLocation = await createLocation('pre-arm-included');
+  try {
+    await collector.addPage(control.page);
+    const excludedId = emitRequestStart(control.session, {
+      requestId: 'pre-arm-excluded',
+      emitResponse: false,
+    });
+    const excludedCapture = await collector.startCapture(
+      control.page,
+      {},
+      firstLocation.location,
+    );
+    emitResponse(control.session, excludedId);
+    emitFinished(control.session, excludedId, 3);
+    await collector.stopCapture(excludedCapture.id);
+    assert.equal(excludedCapture.requests.length, 0);
+
+    const includedId = emitRequestStart(control.session, {
+      requestId: 'pre-arm-included',
+      emitResponse: false,
+    });
+    const includedCapture = await collector.startCapture(
+      control.page,
+      {},
+      secondLocation.location,
+      {includeInFlight: true},
+    );
+    emitResponse(control.session, includedId);
+    await flushMicrotasks();
+    emitText(control.session, includedId, 'data: [DONE]\n\n', 3);
+    emitFinished(control.session, includedId, 4);
+    await collector.stopCapture(includedCapture.id);
+    assert.equal(includedCapture.requests.length, 1);
+    assert.equal(includedCapture.requests[0].requestStartedBeforeCapture, true);
+  } finally {
+    await collector.dispose();
+    await fs.rm(firstLocation.root, {recursive: true, force: true});
+    await fs.rm(secondLocation.root, {recursive: true, force: true});
+  }
+});
+
+test('ExtraInfo snapshot records credentials privately and writes a redacted view', async () => {
+  const {collector, addPage} = createFixture({requestPostData: '{"hello":1}'});
+  const control = addPage();
+  const {root, location} = await createLocation('extra-info');
+  try {
+    await collector.addPage(control.page);
+    const capture = await collector.startCapture(control.page, {}, location);
+    const requestId = emitRequestStart(control.session, {
+      emitResponse: false,
+      hasPostData: true,
+      requestHeaders: {'x-client': 'test'},
+    });
+    emitRequestExtraInfo(control.session, requestId, {
+      authorization: 'Bearer secret-token',
+      cookie: 'session=secret-cookie',
+      'x-client': 'test',
+    });
+    emitResponse(control.session, requestId);
+    emitResponseExtraInfo(control.session, requestId, {
+      'content-type': 'text/event-stream',
+      'set-cookie': 'session=rotated',
+    });
+    await flushMicrotasks();
+    emitText(control.session, requestId, 'data: [DONE]\n\n', 3);
+    emitFinished(control.session, requestId, 4);
+    await collector.stopCapture(capture.id);
+
+    const request = capture.requests[0];
+    assert.equal(request.headersCompleteness, 'complete');
+    assert.equal(request.bodyCompleteness, 'partial');
+    assert.equal(request.bodyCaptureSource, 'cdp-postData-utf8');
+    assert.equal(request.requestSnapshotIntegrity, 'complete');
+    const byKind = (kind: string) =>
+      request.artifacts.find(artifact => artifact.kind === kind)!;
+    const fullHeaders = byKind('request_headers');
+    assert.equal(fullHeaders.sensitivity, 'credential');
+    assert.equal(fullHeaders.containsCredentials, true);
+    const extraText = await fs.readFile(
+      artifactPath(root, byKind('request_headers_extra')),
+      'utf8',
+    );
+    assert.match(extraText, /secret-cookie/);
+    const redactedText = await fs.readFile(
+      artifactPath(root, byKind('request_headers_redacted')),
+      'utf8',
+    );
+    assert.doesNotMatch(redactedText, /secret-token|secret-cookie/);
+    assert.match(redactedText, /\[REDACTED\]/);
+    const bodyMeta = JSON.parse(
+      await fs.readFile(
+        artifactPath(root, byKind('request_body_metadata')),
+        'utf8',
+      ),
+    ) as {wireBytes: boolean; captureSource: string; encoding: string};
+    assert.equal(bodyMeta.wireBytes, false);
+    assert.equal(bodyMeta.captureSource, 'cdp-postData-utf8');
+    assert.equal(bodyMeta.encoding, 'utf-8');
+  } finally {
+    await collector.dispose();
+    await fs.rm(root, {recursive: true, force: true});
+  }
+});
+
+test('persistent artifact IDs remain unique across collector restarts', async () => {
+  const firstFixture = createFixture();
+  const secondFixture = createFixture();
+  const firstPage = firstFixture.addPage();
+  const secondPage = secondFixture.addPage();
+  const firstLocation = await createLocation('uuid-first');
+  const secondLocation = await createLocation('uuid-second');
+  try {
+    await firstFixture.collector.addPage(firstPage.page);
+    await secondFixture.collector.addPage(secondPage.page);
+    const first = await firstFixture.collector.startCapture(
+      firstPage.page,
+      {},
+      firstLocation.location,
+    );
+    const second = await secondFixture.collector.startCapture(
+      secondPage.page,
+      {},
+      secondLocation.location,
+    );
+    assert.equal(first.id, 1);
+    assert.equal(second.id, 1);
+    assert.notEqual(first.uuid, second.uuid);
+    assert.notEqual(
+      first.metadataArtifact.artifactId,
+      second.metadataArtifact.artifactId,
+    );
+    assert.match(first.metadataArtifact.artifactId, /^art_stream_/);
+    await firstFixture.collector.stopCapture(first.id);
+    await secondFixture.collector.stopCapture(second.id);
+  } finally {
+    await firstFixture.collector.dispose();
+    await secondFixture.collector.dispose();
+    await fs.rm(firstLocation.root, {recursive: true, force: true});
+    await fs.rm(secondLocation.root, {recursive: true, force: true});
+  }
+});
+
+test('capture explicitly reports page-target-only worker coverage', async () => {
+  const {collector, addPage} = createFixture();
+  const control = addPage();
+  const {root, location} = await createLocation('coverage');
+  try {
+    await collector.addPage(control.page);
+    const capture = await collector.startCapture(control.page, {}, location);
+    const requestId = emitRequestStart(control.session, {
+      frameId: 'frame-main',
+      loaderId: 'loader-main',
+    });
+    await flushMicrotasks();
+    emitFinished(control.session, requestId, 3);
+    await collector.stopCapture(capture.id);
+    assert.equal(capture.captureScope, 'page-target-only');
+    assert.equal(capture.workerCoverage, false);
+    assert.equal(capture.requests[0].targetType, 'page');
+    assert.equal(capture.requests[0].frameId, 'frame-main');
+    assert.equal(capture.requests[0].workerCoverage, false);
+  } finally {
+    await collector.dispose();
+    await fs.rm(root, {recursive: true, force: true});
+  }
+});
+
+test('stop deadline force-finalizes an unresolved completed request', async () => {
+  const {collector, addPage} = createFixture({
+    streamResourceContent: () => new Promise(() => undefined),
+    collectorOptions: {activationTimeoutMs: 60_000},
+  });
+  const control = addPage();
+  const {root, location} = await createLocation('finalize-deadline');
+  try {
+    await collector.addPage(control.page);
+    const capture = await collector.startCapture(control.page, {}, location);
+    const requestId = emitRequestStart(control.session);
+    emitFinished(control.session, requestId, 3);
+    await collector.stopCapture(capture.id, {
+      deadlineWallTimeMs: Date.now() + 25,
+    });
+    const request = capture.requests[0];
+    assert.equal(capture.status, 'failed');
+    assert.equal(request.status, 'failed');
+    assert.equal(request.terminalReason, 'finalize_timeout');
+    assert.equal(request.failure?.code, 'FINALIZE_TIMEOUT');
+    await fs.stat(artifactPath(root, capture.metadataArtifact));
   } finally {
     await collector.dispose();
     await fs.rm(root, {recursive: true, force: true});

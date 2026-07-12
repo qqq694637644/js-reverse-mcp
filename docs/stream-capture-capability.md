@@ -1,10 +1,8 @@
 # Streaming HTTP Capture Capability
 
-## Purpose
+## Role in the overall system
 
-Ordinary network inspection is sufficient only after Chromium still retains a completed response body. Long-lived `fetch`, XHR, and EventSource streams need a collector that is active while bytes arrive. `Network.streamResourceContent` supplies bytes received before activation as `bufferedData` and supplies later bytes through `Network.dataReceived.data`; the collector must preserve that ordering and must not depend on a later `getResponseBody` call.
-
-This capability is one collector lifecycle primitive represented by three ordinary MCP operations:
+`js-reverse-mcp` is a private browser-analysis dependency. It always registers these three MCP lifecycle primitives:
 
 ```text
 start_stream_capture
@@ -12,161 +10,297 @@ get_stream_status
 stop_stream_capture
 ```
 
-They are lifecycle operations for one collector, not three protocol-analysis variants.
-
-## Exposure modes
-
-### Ordinary MCP
-
-`--toolExposureMode mcp` exposes the three lifecycle operations. A capable MCP client may coordinate them directly.
-
-### GPT Action
-
-`--toolExposureMode gpt-action` removes all three lifecycle operations from `tools/list`.
-
-The GPT Action backend must expose one higher-level operation such as:
+A higher-level service such as `web_rev_action` connects to the ordinary MCP server with a private client and an adapter allowlist. GPT never receives the MCP `tools/list`; it sees only the higher-level Action OpenAPI, especially the atomic operation:
 
 ```text
 runBrowserExperiment(operation = capture_flow)
 ```
 
-The backend owns this complete sequence:
+The Action backend owns:
 
 ```text
-allocate experiment directory
-→ select and align the browser page
-→ start internal stream capture
-→ execute the Playwright flow
-→ wait for completion, cancellation, or failure
-→ stop and finalize capture
+allocate experiment
+→ align the page
+→ start stream capture
+→ run the Playwright flow
+→ wait for an experiment condition
+→ stop/finalize capture
 → write the experiment manifest
-→ return only evidence IDs and workspace-relative paths
 ```
 
-GPT must not coordinate start, page action, wait, and stop as separate Action calls. This repository supplies the internal collector and deployment exposure switch; the downstream Action repository owns the atomic `capture_flow` OpenAPI contract and its contract test.
+Do not ask GPT to coordinate start, click, wait, and stop as separate Action calls.
 
-## Workspace ownership
+## Experiment directory ownership
 
-The deployment must configure both:
+The deployment configures:
 
 ```text
 --allowedRoots <workspace-root>
 --streamArtifactRoot <allowed-root-index-or-exact-root-path>
 ```
 
-`streamArtifactRoot` is deployment configuration and is never a model argument. `js-reverse-mcp` and the downstream workspace file tools must see the same directory contents, either through the same filesystem or an explicit container volume mapping.
-
-MCP responses contain only:
+A private backend may pass a constrained `artifactNamespace`, producing:
 
 ```text
-allowed-root index
-workspace-relative path
-opaque artifact ID
-bounded status and counters
+experiments/<artifactNamespace>/js-reverse/capture-<uuid>/
 ```
 
-They never contain host absolute paths, stream bodies, request bodies, credentials, or CDP Base64.
+This is not an arbitrary output path. Every namespace segment is validated and resolved below the configured root. Deployments without an experiment namespace use `js-reverse-streams/capture-<uuid>/`.
 
-The experiment owner is responsible for retention and cleanup. `js-reverse-mcp` creates capture artifacts but does not delete completed evidence automatically.
+One workspace per MCP process is the simplest deployment. A shared MCP process must use a distinct namespace per experiment/session and keep the selected artifact root mounted into the same Gateway workspace.
 
-## Capture artifacts
+## Capture boundary
 
-Each capture contains `capture.json`. Each matched request contains:
+The current collector is explicit about its scope:
+
+```text
+captureScope = page-target-only
+workerCoverage = false
+```
+
+It records page requests, frame/loader IDs, `fromServiceWorker`, and initiator evidence when CDP supplies them. It does not claim Target auto-attach coverage for worker or service-worker sessions. A higher-level capture-health report must surface this limitation.
+
+## Pre-arm request isolation
+
+Every page has a collector generation. Arming a capture advances the generation.
+
+By default:
+
+```text
+includeInFlight = false
+```
+
+Requests started in an older generation are excluded even when their response arrives after capture start. A private backend may explicitly set `includeInFlight=true` when it needs to observe an already-running request. Every captured request records:
+
+```text
+collectorGeneration
+requestStartedBeforeCapture
+captureArmedMonotonicTimeSeconds
+```
+
+## Requests without a response
+
+A matching request candidate is retained from `Network.requestWillBeSent`. DNS, TLS, CORS, blocking, navigation cancellation, connection failure, and similar failures can therefore produce evidence even when `Network.responseReceived` never arrives.
+
+Each request records:
+
+```text
+responseObserved
+streamActivationAttempted
+failurePhase = before-response | activation | streaming | finalize
+```
+
+Raw stream activation is attempted only after a matching response with an allowed MIME type is observed.
+
+## Raw stream ordering and deadlines
+
+For each response:
+
+1. Call `Network.streamResourceContent`.
+2. Queue `Network.dataReceived` chunks while activation is pending.
+3. Write returned `bufferedData` first.
+4. Release queued chunks in arrival order.
+5. Finalize only after activation, network snapshot collection, queued writes, and metadata.
+
+Activation has an internal timeout and bounded pending memory. `stop_stream_capture` accepts a propagated AbortSignal and a wall-clock deadline. When finalization is interrupted, it aborts activation, closes open handles, writes best-effort request/capture manifests, and marks the request `finalize_timeout` instead of waiting for an abandoned filesystem or CDP operation indefinitely.
+
+## Artifact files
+
+A request directory can contain:
 
 ```text
 metadata.json
 raw.bin
-raw.sse
+decoded.sse
 chunks.jsonl
 events.jsonl
 eventsource.jsonl
 request-headers.json
-request-body.bin
+request-headers-extra.json
+request-headers.redacted.json
+request-body.txt
+request-body.meta.json
 response-headers.json
+response-headers-extra.json
+response-headers.redacted.json
 initiator.json
 redirects.json
 payloads/*
 ```
 
-The minimum request-replay evidence set is:
+`raw.bin` is the exact captured byte sequence. `decoded.sse` is a UTF-8 reading aid and may contain replacement characters for invalid UTF-8. Precise offsets always refer to `raw.bin`.
+
+`request-body.txt` is not wire bytes. Its metadata states:
 
 ```text
+encoding = utf-8
+captureSource = cdp-postData-utf8
+wireBytes = false
+bodyCompleteness = complete | partial | none | unknown
+```
+
+## Request and header completeness
+
+The collector saves both ordinary CDP fields and ExtraInfo fields:
+
+```text
+Network.requestWillBeSent request.headers
+Network.requestWillBeSentExtraInfo headers and associatedCookies
+Network.responseReceived response.headers
+Network.responseReceivedExtraInfo headers/status/blockedCookies
+```
+
+A request records:
+
+```text
+headersCompleteness
+bodyCompleteness
+requestSnapshotIntegrity
+```
+
+This lets a replay tool distinguish a useful browser snapshot from a complete wire-level request. Multipart, file, binary, or omitted post data must not be described as exact body bytes.
+
+## Credential artifacts
+
+Full request/response header artifacts may contain Cookie, Authorization, CSRF, or Set-Cookie data. Their descriptors include:
+
+```text
+sensitivity = credential
+containsCredentials = true
+redactedArtifactId = <public redacted artifact>
+```
+
+Default report, search, diff, and natural-language paths should use the redacted artifact. Full credential artifacts are for explicit local replay operations and should not be copied into GPT summaries or logs.
+
+## Persistent identifiers
+
+The numeric `captureId` is a short-lived MCP handle. Persistent artifact identifiers use a capture UUID:
+
+```text
+art_stream_<capture-uuid>_<request-index>_<kind>
+```
+
+Each request also records:
+
+```text
+persistentRequestId
 cdpRequestId
-networkRequestId / reqid when correlation is available
-request headers artifact
-request body artifact
-response status and headers artifact
-redirect chain artifact
-initiator artifact
-raw stream artifact
-parsed event artifact
+networkRequestId
+networkRequestIdLifetime = page-collector-generation
+collectorGeneration
 ```
 
-Sensitive material remains in workspace files and is not returned through MCP structured content.
+`networkRequestId` is only a temporary correlation to `list_network_requests`. A higher-level experiment manifest must generate its own stable `evidence_id`.
 
-## Time model
+## Network terminal semantics
 
-CDP event timestamps use a monotonic clock. Request start also includes a wall-clock value. The collector records both explicitly:
+The collector reports neutral transport/lifecycle facts. A canceled CDP request becomes:
 
 ```text
-monotonicTimeSeconds
-wallTimeMs
+status = canceled
+terminalReason = network_canceled
 ```
 
-The `requestWillBeSent.wallTime` and `requestWillBeSent.timestamp` pair establishes the conversion offset used for later chunk and terminal events. The manifest does not use ambiguous generic `timestamp`, `startedAt`, or `endedAt` fields.
+The collector does not infer that the user clicked Stop. `web_rev_action` may classify a cancellation as `expected_user_cancel` only after correlating the Playwright Stop step, time window, page, and target request.
 
-## Activation and ordering
+## Completion predicates
 
-For every request:
+The parser records a convenience field:
 
-1. Call `Network.streamResourceContent`.
-2. Queue `dataReceived` chunks until activation settles.
-3. Process `bufferedData` first.
-4. Release queued chunks in arrival order.
-5. Finalize only after activation, queued chunks, writes, and metadata complete.
+```text
+defaultDoneMarker = (trimmed event data equals "[DONE]")
+```
 
-Activation has an internal timeout. Pending bytes have a separate in-memory limit. Stop, page close, and shutdown can abort activation, after which a final manifest is still written.
+This is not the universal definition of stream completion. A higher-level `capture_flow` supplies its own controlled predicate, for example:
 
-## Completion and integrity matrix
+```text
+exact_data
+event_name
+json_path_equals
+network_terminal
+selector_state
+```
 
-`request.status` describes the network/lifecycle terminal state. `integrityStatus` describes evidence completeness. They are intentionally separate.
+Network terminal state and raw events remain authoritative evidence.
 
-| Situation                                                                                      | Request status           | Terminal reason                            | Integrity       |
-| ---------------------------------------------------------------------------------------------- | ------------------------ | ------------------------------------------ | --------------- |
-| Raw fetch/XHR stream captured and all core artifacts written                                   | `finished`               | `completed`                                | `complete`      |
-| Expected user stop causes CDP cancellation but captured evidence is complete                   | `canceled`               | `user_cancel`                              | `complete`      |
-| Native EventSource raw activation fails, but semantic mirror events are saved                  | `finished` or `canceled` | network terminal reason                    | `semantic-only` |
-| Raw bytes exist but parser degrades, supporting artifact fails, or a noncritical payload fails | network terminal state   | network terminal reason                    | `partial`       |
-| Fetch/XHR activation fails or times out                                                        | `failed`                 | `activation_error` or `activation_timeout` | `failed`        |
-| Pending activation memory limit is exceeded                                                    | `failed`                 | `pending_limit`                            | `failed`        |
-| Core artifact initialization/write fails                                                       | `failed`                 | `artifact_error`                           | `failed`        |
-| Disk quota is exceeded                                                                         | `failed`                 | `quota`                                    | `failed`        |
-| Page closes before finalization                                                                | `failed`                 | `page_close`                               | `failed`        |
-| Shutdown cannot finalize within its deadline                                                   | `failed`                 | `shutdown_timeout`                         | `failed`        |
+## Integrity dimensions
 
-A downstream Action may treat `canceled/user_cancel` as the expected result of a stop-generation experiment. It must not treat `semantic-only`, `partial`, or `failed` as equivalent to `complete` when validating raw SSE capture.
+Each request exposes separate dimensions:
+
+```text
+rawCaptureIntegrity
+semanticParseIntegrity
+requestSnapshotIntegrity
+artifactIntegrity
+```
+
+Possible values are:
+
+```text
+complete | partial | failed | not-attempted
+```
+
+The legacy summary `integrityStatus` remains for compact MCP status. The capture also reports `collectorIntegrity`, which is a collector-wide worst-case diagnostic. It is not experiment success.
+
+A higher-level Action must select target requests and calculate:
+
+```text
+primaryRequestIntegrity
+objectiveIntegrity
+```
+
+using its `primaryRequestMatcher`, expected match count, and `allowSupportingFailures` policy. An unrelated telemetry stream failure must not automatically fail the primary conversation experiment.
+
+## Event positions and time
+
+CDP monotonic and wall times are saved separately. Parsed events can include:
+
+```text
+rawByteStart
+rawByteEnd
+decodedCharStart
+decodedCharEnd
+firstChunkIndex
+lastChunkIndex
+firstByteMonotonicTimeSeconds
+firstByteWallTimeMs
+completedMonotonicTimeSeconds
+completedWallTimeMs
+```
+
+This supports targeted workspace reads from `raw.bin` without loading an entire stream into GPT context.
 
 ## Parser degradation
 
-The semantic parser is a bounded byte-oriented line state machine. It supports BOM, `LF`, `CRLF`, `CR`, and mixed line endings. Every event records raw byte offsets, decoded character offsets, first/last chunk indexes, and first/completed times.
+The semantic parser is a bounded byte-oriented line state machine supporting BOM, LF, CRLF, CR, and mixed line endings. Oversized events, incomplete tails, or invalid UTF-8 can degrade semantic parsing while exact `raw.bin` evidence remains usable for offline parsing.
 
-If one event or an incomplete tail exceeds the configured parser limit, semantic parsing becomes `degraded` while `raw.bin`, chunk offsets, and subsequent collector metadata continue to be preserved. Invalid UTF-8 is recorded and replacement decoding is limited to the readable `raw.sse`/event representation; exact bytes remain in `raw.bin`.
+## Lifecycle immutability
 
-## Resource limits
+Only active `armed` or `capturing` captures are changed when a page closes. A stopped/finalized capture is immutable; closing its former page does not rewrite its status or manifest.
 
-The collector applies explicit limits for:
+## Downstream wait contract
+
+Polling `get_stream_status` is available to ordinary MCP clients. A higher-level private adapter should expose an internal wait method rather than a GPT-visible Action:
 
 ```text
-disk bytes per capture
-activation duration
-pending activation bytes
-SSE event / incomplete-tail bytes
-requests per capture
-artifacts per capture
-payloads per request
-events per request
-metadata bytes
-shutdown finalization time
+waitForStreamCondition(
+  captureId,
+  requestMatcher,
+  condition,
+  sinceVersion,
+  deadline
+)
 ```
 
-Limits never silently convert an incomplete capture into a normal successful result. The manifest records the limit, reason, time, and dropped counts where applicable.
+Conditions should include:
+
+```text
+first_event
+event_predicate
+default_done_marker
+network_finished
+network_canceled
+failed
+```
+
+The adapter owns polling cadence, deadline propagation, primary-request selection, and Action-level objective evaluation.

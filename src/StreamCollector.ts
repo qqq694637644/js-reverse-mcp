@@ -5,7 +5,7 @@
  */
 
 import {Buffer} from 'node:buffer';
-import {createHash, type Hash} from 'node:crypto';
+import {createHash, randomUUID, type Hash} from 'node:crypto';
 import {constants as fsConstants} from 'node:fs';
 import type * as fs from 'node:fs/promises';
 import path from 'node:path';
@@ -36,9 +36,19 @@ export type StreamIntegrityStatus =
   | 'partial'
   | 'failed';
 export type StreamParseStatus = 'complete' | 'degraded' | 'raw-only';
+export type StreamEvidenceIntegrity =
+  | 'complete'
+  | 'partial'
+  | 'failed'
+  | 'not-attempted';
+export type StreamSnapshotCompleteness =
+  | 'complete'
+  | 'partial'
+  | 'none'
+  | 'unknown';
 export type StreamTerminalReason =
   | 'completed'
-  | 'user_cancel'
+  | 'network_canceled'
   | 'page_close'
   | 'network_error'
   | 'quota'
@@ -47,6 +57,7 @@ export type StreamTerminalReason =
   | 'pending_limit'
   | 'activation_error'
   | 'artifact_error'
+  | 'finalize_timeout'
   | 'shutdown_timeout';
 export type StreamEventSource = 'raw-stream' | 'eventsource';
 export type StreamEventRecordType = 'event' | 'heartbeat';
@@ -56,6 +67,10 @@ export interface StreamCaptureFilter {
   methods?: string[];
   resourceTypes?: string[];
   mimeTypes?: string[];
+}
+
+export interface StreamCaptureOptions {
+  includeInFlight?: boolean;
 }
 
 export interface StreamCaptureLocation {
@@ -71,13 +86,18 @@ export interface StreamArtifactFile {
     | 'capture_metadata'
     | 'request_metadata'
     | 'raw_bytes'
-    | 'raw_text'
+    | 'decoded_text'
     | 'chunks'
     | 'events'
     | 'eventsource_events'
     | 'request_headers'
-    | 'request_body'
+    | 'request_headers_extra'
+    | 'request_headers_redacted'
+    | 'request_body_text'
+    | 'request_body_metadata'
     | 'response_headers'
+    | 'response_headers_extra'
+    | 'response_headers_redacted'
     | 'initiator'
     | 'redirects'
     | 'payload';
@@ -86,6 +106,11 @@ export interface StreamArtifactFile {
   bytes: number;
   sha256?: string;
   mimeType?: string;
+  sensitivity?: 'public' | 'private' | 'credential';
+  containsCredentials?: boolean;
+  encoding?: string;
+  captureSource?: string;
+  redactedArtifactId?: string;
   writeStatus: 'pending' | 'written' | 'failed';
   error?: string;
 }
@@ -107,7 +132,7 @@ export interface StreamEventSummary {
   index: number;
   recordType: StreamEventRecordType;
   eventName?: string;
-  done: boolean;
+  defaultDoneMarker: boolean;
   source: StreamEventSource;
   dataLength: number;
   payloadCount: number;
@@ -144,12 +169,26 @@ export interface StreamFailure {
     | 'PENDING_BUFFER_LIMIT'
     | 'ACTIVATION_ERROR'
     | 'ARTIFACT_ERROR'
+    | 'FINALIZE_TIMEOUT'
     | 'SHUTDOWN_TIMEOUT';
 }
 
 export interface StreamRequest {
   cdpRequestId: string;
+  persistentRequestId: string;
   networkRequestId?: number;
+  networkRequestIdLifetime: 'page-collector-generation';
+  collectorGeneration: number;
+  requestStartedBeforeCapture: boolean;
+  responseObserved: boolean;
+  streamActivationAttempted: boolean;
+  failurePhase?: 'before-response' | 'activation' | 'streaming' | 'finalize';
+  captureScope: 'page-target-only';
+  workerCoverage: false;
+  targetType: 'page';
+  frameId?: string;
+  loaderId?: string;
+  fromServiceWorker?: boolean;
   requestIndex: number;
   url: string;
   method: string;
@@ -160,6 +199,13 @@ export interface StreamRequest {
   status: StreamRequestStatus;
   terminalReason?: StreamTerminalReason;
   integrityStatus: StreamIntegrityStatus;
+  rawCaptureIntegrity: StreamEvidenceIntegrity;
+  semanticParseIntegrity: StreamEvidenceIntegrity;
+  requestSnapshotIntegrity: StreamEvidenceIntegrity;
+  artifactIntegrity: StreamEvidenceIntegrity;
+  headersCompleteness: StreamSnapshotCompleteness;
+  bodyCompleteness: StreamSnapshotCompleteness;
+  bodyCaptureSource: 'cdp-postData-utf8' | 'none' | 'unavailable';
   parseStatus: StreamParseStatus;
   parseDegradedReason?: string;
   startedMonotonicTimeSeconds: number;
@@ -175,7 +221,7 @@ export interface StreamRequest {
   rawEventCount: number;
   semanticEventCount: number;
   primaryEventSource: StreamEventSource | 'none';
-  doneMarkerObserved: boolean;
+  defaultDoneMarkerObserved: boolean;
   invalidUtf8Count: number;
   incompleteTailBytes: number;
   rawBytes: number;
@@ -190,8 +236,15 @@ export interface StreamRequest {
 
 export interface StreamCapture {
   id: number;
+  uuid: string;
   status: StreamCaptureStatus;
   integrityStatus: StreamIntegrityStatus;
+  collectorIntegrity: StreamIntegrityStatus;
+  collectorGeneration: number;
+  captureArmedMonotonicTimeSeconds?: number;
+  includeInFlight: boolean;
+  captureScope: 'page-target-only';
+  workerCoverage: false;
   filter: StreamCaptureFilter;
   artifactRootIndex: number;
   relativeDir: string;
@@ -220,7 +273,7 @@ export interface SseEvent {
   data: string;
   retry?: number;
   comments: string[];
-  done: boolean;
+  defaultDoneMarker: boolean;
   source: StreamEventSource;
   invalidUtf8: boolean;
   rawByteStart?: number;
@@ -257,10 +310,15 @@ interface RequestMetadata {
   url: string;
   method: string;
   resourceType?: string;
+  collectorGeneration: number;
+  frameId?: string;
+  loaderId?: string;
   headers: Protocol.Network.Headers;
   postData?: string;
   hasPostData?: boolean;
   initiator?: Protocol.Network.Initiator;
+  requestExtraInfo?: Protocol.Network.RequestWillBeSentExtraInfoEvent;
+  responseExtraInfo?: Protocol.Network.ResponseReceivedExtraInfoEvent;
   redirects: Array<{
     url: string;
     status: number;
@@ -308,9 +366,11 @@ interface RequestRuntime {
   page: Page;
   client: Awaited<ReturnType<CdpSessionProvider['getSession']>>;
   metadata: RequestMetadata;
+  responseEvent?: Protocol.Network.ResponseReceivedEvent;
   absoluteDir: string;
   initializationPromise: Promise<void>;
   snapshotPromise: Promise<void>;
+  snapshotStarted: boolean;
   parser: BoundedSseParser;
   textDecoder: TextDecoder;
   rawOffset: number;
@@ -329,6 +389,7 @@ interface RequestRuntime {
   pendingBytes: number;
   terminal?: RequestTerminal;
   finalized: boolean;
+  forceTerminated: boolean;
   finalizePromise?: Promise<void>;
   artifacts: Map<StreamArtifactFile['kind'], ArtifactRuntime>;
 }
@@ -386,7 +447,7 @@ const DEFAULT_MAX_ARTIFACTS = 2_000;
 const DEFAULT_MAX_PAYLOADS = 500;
 const DEFAULT_MAX_EVENTS = 100_000;
 const DEFAULT_SHUTDOWN_TIMEOUT_MS = 4_500;
-const BASE_REQUEST_ARTIFACT_COUNT = 11;
+const BASE_REQUEST_ARTIFACT_COUNT = 16;
 
 function getErrorText(error: unknown): string {
   const message = error instanceof Error ? error.message : String(error);
@@ -406,6 +467,26 @@ function bounded(value: string | undefined, max = 4096): string | undefined {
     return value;
   }
   return `${value.slice(0, max - 32)}…[truncated ${value.length - max + 32} chars]`;
+}
+
+const CREDENTIAL_HEADER_PATTERN =
+  /^(authorization|cookie|set-cookie|proxy-authorization|x-csrf-token|x-xsrf-token)$/i;
+
+function redactHeaders(
+  headers: Protocol.Network.Headers,
+): Protocol.Network.Headers {
+  return Object.fromEntries(
+    Object.entries(headers).map(([name, value]) => [
+      name,
+      CREDENTIAL_HEADER_PATTERN.test(name) ? '[REDACTED]' : value,
+    ]),
+  );
+}
+
+function containsCredentialHeaders(headers: Protocol.Network.Headers): boolean {
+  return Object.keys(headers).some(name =>
+    CREDENTIAL_HEADER_PATTERN.test(name),
+  );
 }
 
 function normalizedList(values?: string[]): string[] | undefined {
@@ -430,10 +511,9 @@ function normalizeFilter(filter: StreamCaptureFilter): StreamCaptureFilter {
   };
 }
 
-function matchesFilter(
+function matchesRequestFilter(
   filter: StreamCaptureFilter,
   metadata: RequestMetadata,
-  mimeType?: string,
 ): boolean {
   if (filter.urlFilter && !metadata.url.includes(filter.urlFilter)) {
     return false;
@@ -447,6 +527,17 @@ function matchesFilter(
     resourceTypes &&
     !resourceTypes.includes((metadata.resourceType ?? '').toLowerCase())
   ) {
+    return false;
+  }
+  return true;
+}
+
+function matchesFilter(
+  filter: StreamCaptureFilter,
+  metadata: RequestMetadata,
+  mimeType?: string,
+): boolean {
+  if (!matchesRequestFilter(filter, metadata)) {
     return false;
   }
   const mimeTypes = normalizedList(filter.mimeTypes);
@@ -686,7 +777,7 @@ class BoundedSseParser {
       data,
       retry: state.retry,
       comments: state.comments,
-      done: data.trim() === '[DONE]',
+      defaultDoneMarker: data.trim() === '[DONE]',
       source: 'raw-stream',
       invalidUtf8: state.invalidUtf8,
       rawByteStart: state.rawByteStart,
@@ -816,15 +907,20 @@ function createArtifact(
   relativePath: string,
   suffix: string,
   criticality: ArtifactRuntime['criticality'],
+  descriptorOptions: Pick<
+    StreamArtifactFile,
+    'sensitivity' | 'containsCredentials' | 'encoding' | 'captureSource'
+  > = {},
 ): ArtifactRuntime {
   return {
     descriptor: {
-      artifactId: `stream-${capture.id}-${suffix}`,
+      artifactId: `art_stream_${capture.uuid}_${suffix}`,
       kind,
       rootIndex: capture.artifactRootIndex,
       relativePath: toPortablePath(relativePath),
       bytes: 0,
       writeStatus: 'pending',
+      ...descriptorOptions,
     },
     relativeToRequestDir: path.basename(relativePath),
     hash: createHash('sha256'),
@@ -850,6 +946,8 @@ export class StreamCollector {
   #requestRuntime = new WeakMap<StreamRequest, RequestRuntime>();
   #requestOwners = new WeakMap<Page, Map<string, StreamRequest>>();
   #requestMetadata = new WeakMap<Page, Map<string, RequestMetadata>>();
+  #pageGeneration = new WeakMap<Page, number>();
+  #latestMonotonicTime = new WeakMap<Page, number>();
   #cdpCleanup = new WeakMap<Page, () => void>();
   #pageCloseListeners = new WeakMap<Page, () => void>();
   #pageInitializations = new WeakMap<Page, Promise<void>>();
@@ -973,6 +1071,7 @@ export class StreamCollector {
   async #initializePage(page: Page): Promise<void> {
     this.#requestMetadata.set(page, new Map());
     this.#requestOwners.set(page, new Map());
+    this.#pageGeneration.set(page, 0);
     const onClose = () => {
       const closePromise = this.#handlePageClosed(page);
       this.#pageClosePromises.set(page, closePromise);
@@ -994,10 +1093,19 @@ export class StreamCollector {
     const client = await this.#sessionProvider.getSession(page);
     const metadataMap = this.#requestMetadata.get(page)!;
     const ownerMap = this.#requestOwners.get(page)!;
+    const requestExtraInfoMap = new Map<
+      string,
+      Protocol.Network.RequestWillBeSentExtraInfoEvent
+    >();
+    const responseExtraInfoMap = new Map<
+      string,
+      Protocol.Network.ResponseReceivedExtraInfoEvent
+    >();
 
     const onRequestWillBeSent = (
       event: Protocol.Network.RequestWillBeSentEvent,
     ): void => {
+      this.#latestMonotonicTime.set(page, event.timestamp);
       const previous = metadataMap.get(event.requestId);
       const redirects = previous?.redirects ?? [];
       if (event.redirectResponse) {
@@ -1013,10 +1121,16 @@ export class StreamCollector {
         url: event.request.url,
         method: event.request.method,
         resourceType: event.type,
+        collectorGeneration:
+          previous?.collectorGeneration ?? this.#pageGeneration.get(page) ?? 0,
+        frameId: event.frameId,
+        loaderId: event.loaderId,
         headers: event.request.headers,
         postData: event.request.postData,
         hasPostData: event.request.hasPostData,
         initiator: event.initiator,
+        requestExtraInfo: requestExtraInfoMap.get(event.requestId),
+        responseExtraInfo: responseExtraInfoMap.get(event.requestId),
         redirects,
         startedMonotonicTimeSeconds: event.timestamp,
         startedWallTimeMs: Number.isFinite(event.wallTime)
@@ -1028,9 +1142,40 @@ export class StreamCollector {
       });
     };
 
+    const onRequestWillBeSentExtraInfo = (
+      event: Protocol.Network.RequestWillBeSentExtraInfoEvent,
+    ): void => {
+      requestExtraInfoMap.set(event.requestId, event);
+      const metadata = metadataMap.get(event.requestId);
+      if (metadata) {
+        metadata.requestExtraInfo = event;
+      }
+      const request = ownerMap.get(event.requestId);
+      const runtime = request ? this.#requestRuntime.get(request) : undefined;
+      if (runtime) {
+        runtime.metadata.requestExtraInfo = event;
+      }
+    };
+
+    const onResponseReceivedExtraInfo = (
+      event: Protocol.Network.ResponseReceivedExtraInfoEvent,
+    ): void => {
+      responseExtraInfoMap.set(event.requestId, event);
+      const metadata = metadataMap.get(event.requestId);
+      if (metadata) {
+        metadata.responseExtraInfo = event;
+      }
+      const request = ownerMap.get(event.requestId);
+      const runtime = request ? this.#requestRuntime.get(request) : undefined;
+      if (runtime) {
+        runtime.metadata.responseExtraInfo = event;
+      }
+    };
+
     const onResponseReceived = (
       event: Protocol.Network.ResponseReceivedEvent,
     ): void => {
+      this.#latestMonotonicTime.set(page, event.timestamp);
       const capture = this.#activeCaptureByPage.get(page);
       if (!capture || !['armed', 'capturing'].includes(capture.status)) {
         return;
@@ -1040,11 +1185,21 @@ export class StreamCollector {
         url: event.response.url,
         method: 'GET',
         resourceType: event.type,
+        collectorGeneration: this.#pageGeneration.get(page) ?? 0,
+        frameId: event.frameId,
+        loaderId: event.loaderId,
         headers: {},
         redirects: [],
         startedMonotonicTimeSeconds: event.timestamp,
       };
       metadata.resourceType ??= event.type;
+      metadata.responseExtraInfo ??= responseExtraInfoMap.get(event.requestId);
+      if (
+        !capture.includeInFlight &&
+        metadata.collectorGeneration !== capture.collectorGeneration
+      ) {
+        return;
+      }
       if (!matchesFilter(capture.filter, metadata, event.response.mimeType)) {
         return;
       }
@@ -1094,6 +1249,7 @@ export class StreamCollector {
     const onDataReceived = (
       event: Protocol.Network.DataReceivedEvent,
     ): void => {
+      this.#latestMonotonicTime.set(page, event.timestamp);
       const request = ownerMap.get(event.requestId);
       const runtime = request ? this.#requestRuntime.get(request) : undefined;
       if (!request || !runtime || runtime.finalized) {
@@ -1145,6 +1301,7 @@ export class StreamCollector {
     const onEventSourceMessage = (
       event: Protocol.Network.EventSourceMessageReceivedEvent,
     ): void => {
+      this.#latestMonotonicTime.set(page, event.timestamp);
       const request = ownerMap.get(event.requestId);
       const runtime = request ? this.#requestRuntime.get(request) : undefined;
       if (!request || !runtime || runtime.finalized) {
@@ -1157,7 +1314,7 @@ export class StreamCollector {
         eventId: event.eventId || undefined,
         data: event.data,
         comments: [],
-        done: event.data.trim() === '[DONE]',
+        defaultDoneMarker: event.data.trim() === '[DONE]',
         source: 'eventsource',
         invalidUtf8: false,
         completedMonotonicTimeSeconds: event.timestamp,
@@ -1172,7 +1329,10 @@ export class StreamCollector {
     const onLoadingFinished = (
       event: Protocol.Network.LoadingFinishedEvent,
     ): void => {
+      this.#latestMonotonicTime.set(page, event.timestamp);
       metadataMap.delete(event.requestId);
+      requestExtraInfoMap.delete(event.requestId);
+      responseExtraInfoMap.delete(event.requestId);
       const request = ownerMap.get(event.requestId);
       const runtime = request ? this.#requestRuntime.get(request) : undefined;
       if (!request || !runtime) {
@@ -1193,16 +1353,47 @@ export class StreamCollector {
     const onLoadingFailed = (
       event: Protocol.Network.LoadingFailedEvent,
     ): void => {
+      this.#latestMonotonicTime.set(page, event.timestamp);
+      const capture = this.#activeCaptureByPage.get(page);
+      const metadata = metadataMap.get(event.requestId);
+      let request = ownerMap.get(event.requestId);
+      if (
+        !request &&
+        capture &&
+        ['armed', 'capturing'].includes(capture.status) &&
+        metadata &&
+        matchesRequestFilter(capture.filter, metadata) &&
+        (capture.includeInFlight ||
+          metadata.collectorGeneration === capture.collectorGeneration)
+      ) {
+        request = this.#createRequest(
+          capture,
+          page,
+          client,
+          metadata,
+          undefined,
+        );
+        ownerMap.set(event.requestId, request);
+        capture.requests.push(request);
+        capture.status = 'capturing';
+        capture.version++;
+      }
       metadataMap.delete(event.requestId);
-      const request = ownerMap.get(event.requestId);
+      requestExtraInfoMap.delete(event.requestId);
+      responseExtraInfoMap.delete(event.requestId);
       const runtime = request ? this.#requestRuntime.get(request) : undefined;
       if (!request || !runtime) {
         return;
       }
       const canceled = Boolean(event.canceled);
+      request.failurePhase = request.responseObserved
+        ? request.streamActivationAttempted
+          ? 'streaming'
+          : 'activation'
+        : 'before-response';
       this.#setTerminal(request, runtime, {
         status: canceled ? 'canceled' : 'failed',
-        reason: canceled ? 'user_cancel' : 'network_error',
+        reason: canceled ? 'network_canceled' : 'network_error',
         endedMonotonicTimeSeconds: event.timestamp,
         endedWallTimeMs:
           wallTimeFromMonotonic(
@@ -1228,8 +1419,18 @@ export class StreamCollector {
       );
       removeCdpEventListener(
         client,
+        'Network.requestWillBeSentExtraInfo',
+        onRequestWillBeSentExtraInfo,
+      );
+      removeCdpEventListener(
+        client,
         'Network.responseReceived',
         onResponseReceived,
+      );
+      removeCdpEventListener(
+        client,
+        'Network.responseReceivedExtraInfo',
+        onResponseReceivedExtraInfo,
       );
       removeCdpEventListener(client, 'Network.dataReceived', onDataReceived);
       removeCdpEventListener(
@@ -1254,8 +1455,18 @@ export class StreamCollector {
       );
       addCdpEventListener(
         client,
+        'Network.requestWillBeSentExtraInfo',
+        onRequestWillBeSentExtraInfo,
+      );
+      addCdpEventListener(
+        client,
         'Network.responseReceived',
         onResponseReceived,
+      );
+      addCdpEventListener(
+        client,
+        'Network.responseReceivedExtraInfo',
+        onResponseReceivedExtraInfo,
       );
       addCdpEventListener(client, 'Network.dataReceived', onDataReceived);
       addCdpEventListener(
@@ -1281,7 +1492,7 @@ export class StreamCollector {
     page: Page,
     client: Awaited<ReturnType<CdpSessionProvider['getSession']>>,
     metadata: RequestMetadata,
-    responseEvent: Protocol.Network.ResponseReceivedEvent,
+    responseEvent?: Protocol.Network.ResponseReceivedEvent,
   ): StreamRequest {
     const captureRuntime = this.#captureRuntime.get(capture)!;
     const requestIndex = capture.requests.length;
@@ -1295,15 +1506,43 @@ export class StreamCollector {
     );
     const request: StreamRequest = {
       cdpRequestId: metadata.cdpRequestId,
+      persistentRequestId: `req_stream_${capture.uuid}_${requestIndex + 1}`,
+      networkRequestIdLifetime: 'page-collector-generation',
+      collectorGeneration: metadata.collectorGeneration,
+      requestStartedBeforeCapture:
+        metadata.collectorGeneration !== capture.collectorGeneration,
+      responseObserved: Boolean(responseEvent),
+      streamActivationAttempted: false,
+      captureScope: 'page-target-only',
+      workerCoverage: false,
+      targetType: 'page',
+      frameId: metadata.frameId,
+      loaderId: metadata.loaderId,
+      fromServiceWorker: responseEvent?.response.fromServiceWorker,
       requestIndex,
       url: bounded(metadata.url, 8192) ?? metadata.url,
       method: metadata.method,
       resourceType: metadata.resourceType,
-      mimeType: responseEvent.response.mimeType,
-      responseStatus: responseEvent.response.status,
-      responseStatusText: bounded(responseEvent.response.statusText, 512),
-      status: 'activating',
+      mimeType: responseEvent?.response.mimeType,
+      responseStatus: responseEvent?.response.status,
+      responseStatusText: bounded(responseEvent?.response.statusText, 512),
+      status: responseEvent ? 'activating' : 'failed',
       integrityStatus: 'failed',
+      rawCaptureIntegrity: responseEvent ? 'not-attempted' : 'not-attempted',
+      semanticParseIntegrity: 'not-attempted',
+      requestSnapshotIntegrity: 'partial',
+      artifactIntegrity: 'complete',
+      headersCompleteness: metadata.requestExtraInfo ? 'complete' : 'partial',
+      bodyCompleteness: metadata.hasPostData
+        ? metadata.postData
+          ? 'partial'
+          : 'unknown'
+        : 'none',
+      bodyCaptureSource: metadata.hasPostData
+        ? metadata.postData
+          ? 'cdp-postData-utf8'
+          : 'unavailable'
+        : 'none',
       parseStatus: 'complete',
       startedMonotonicTimeSeconds: metadata.startedMonotonicTimeSeconds,
       startedWallTimeMs: metadata.startedWallTimeMs,
@@ -1314,7 +1553,7 @@ export class StreamCollector {
       rawEventCount: 0,
       semanticEventCount: 0,
       primaryEventSource: 'none',
-      doneMarkerObserved: false,
+      defaultDoneMarkerObserved: false,
       invalidUtf8Count: 0,
       incompleteTailBytes: 0,
       rawBytes: 0,
@@ -1334,9 +1573,11 @@ export class StreamCollector {
       page,
       client,
       metadata,
+      responseEvent,
       absoluteDir,
       initializationPromise: Promise.resolve(),
       snapshotPromise: Promise.resolve(),
+      snapshotStarted: false,
       parser: new BoundedSseParser(
         this.#limits.maxSseEventBytes,
         this.#limits.maxIncompleteTailBytes,
@@ -1356,20 +1597,16 @@ export class StreamCollector {
       pendingChunks: [],
       pendingBytes: 0,
       finalized: false,
+      forceTerminated: false,
       artifacts,
     };
-    runtime.initializationPromise = this.#initializeRequestFiles(
+    const initializationPromise = this.#initializeRequestFiles(
       request,
       runtime,
     );
-    runtime.writeChain = runtime.initializationPromise;
-    const snapshotPromise = this.#writeNetworkSnapshot(
-      request,
-      runtime,
-      responseEvent,
-    );
-    void snapshotPromise.catch(() => undefined);
-    runtime.snapshotPromise = snapshotPromise;
+    void initializationPromise.catch(() => undefined);
+    runtime.initializationPromise = initializationPromise;
+    runtime.writeChain = initializationPromise;
     this.#requestRuntime.set(request, runtime);
     return request;
   }
@@ -1388,7 +1625,7 @@ export class StreamCollector {
     > = [
       ['request_metadata', 'metadata.json', 'metadata', 'critical'],
       ['raw_bytes', 'raw.bin', 'raw', 'critical'],
-      ['raw_text', 'raw.sse', 'text', 'supporting'],
+      ['decoded_text', 'decoded.sse', 'decoded-text', 'supporting'],
       ['chunks', 'chunks.jsonl', 'chunks', 'critical'],
       ['events', 'events.jsonl', 'events', 'supporting'],
       ['eventsource_events', 'eventsource.jsonl', 'eventsource', 'supporting'],
@@ -1398,28 +1635,110 @@ export class StreamCollector {
         'request-headers',
         'supporting',
       ],
-      ['request_body', 'request-body.bin', 'request-body', 'supporting'],
+      [
+        'request_headers_extra',
+        'request-headers-extra.json',
+        'request-headers-extra',
+        'supporting',
+      ],
+      [
+        'request_headers_redacted',
+        'request-headers.redacted.json',
+        'request-headers-redacted',
+        'supporting',
+      ],
+      [
+        'request_body_text',
+        'request-body.txt',
+        'request-body-text',
+        'supporting',
+      ],
+      [
+        'request_body_metadata',
+        'request-body.meta.json',
+        'request-body-metadata',
+        'supporting',
+      ],
       [
         'response_headers',
         'response-headers.json',
         'response-headers',
         'supporting',
       ],
+      [
+        'response_headers_extra',
+        'response-headers-extra.json',
+        'response-headers-extra',
+        'supporting',
+      ],
+      [
+        'response_headers_redacted',
+        'response-headers.redacted.json',
+        'response-headers-redacted',
+        'supporting',
+      ],
       ['initiator', 'initiator.json', 'initiator', 'supporting'],
       ['redirects', 'redirects.json', 'redirects', 'supporting'],
     ];
-    return new Map(
-      definitions.map(([kind, filename, suffix, criticality]) => [
-        kind,
-        createArtifact(
-          capture,
+    const artifacts = new Map(
+      definitions.map(([kind, filename, suffix, criticality]) => {
+        const containsCredentials = [
+          'request_headers',
+          'request_headers_extra',
+          'response_headers',
+          'response_headers_extra',
+        ].includes(kind);
+        return [
           kind,
-          path.join(request.relativeDir, filename),
-          `request-${request.requestIndex + 1}-${suffix}`,
-          criticality,
-        ),
-      ]),
+          createArtifact(
+            capture,
+            kind,
+            path.join(request.relativeDir, filename),
+            `request-${request.requestIndex + 1}-${suffix}`,
+            criticality,
+            {
+              sensitivity: containsCredentials
+                ? 'credential'
+                : [
+                      'request_headers_redacted',
+                      'response_headers_redacted',
+                    ].includes(kind)
+                  ? 'public'
+                  : 'private',
+              containsCredentials,
+              encoding:
+                kind === 'request_body_text' || kind === 'decoded_text'
+                  ? 'utf-8'
+                  : undefined,
+              captureSource:
+                kind === 'request_body_text' ? 'cdp-postData' : undefined,
+            },
+          ),
+        ];
+      }),
     );
+    const requestRedacted = artifacts.get(
+      'request_headers_redacted',
+    )?.descriptor;
+    const responseRedacted = artifacts.get(
+      'response_headers_redacted',
+    )?.descriptor;
+    for (const kind of ['request_headers', 'request_headers_extra'] as const) {
+      if (requestRedacted) {
+        artifacts.get(kind)!.descriptor.redactedArtifactId =
+          requestRedacted.artifactId;
+      }
+    }
+    for (const kind of [
+      'response_headers',
+      'response_headers_extra',
+    ] as const) {
+      if (responseRedacted) {
+        artifacts.get(kind)!.descriptor.redactedArtifactId =
+          responseRedacted.artifactId;
+      }
+    }
+    return artifacts;
   }
 
   async #initializeRequestFiles(
@@ -1461,7 +1780,7 @@ export class StreamCollector {
   async #writeNetworkSnapshot(
     request: StreamRequest,
     runtime: RequestRuntime,
-    responseEvent: Protocol.Network.ResponseReceivedEvent,
+    responseEvent?: Protocol.Network.ResponseReceivedEvent,
   ): Promise<void> {
     await runtime.initializationPromise;
     let postData = runtime.metadata.postData;
@@ -1477,8 +1796,41 @@ export class StreamCollector {
             `Could not obtain request post data: ${getErrorText(error)}`,
           ) ?? 'Could not obtain request post data.',
         );
-        request.integrityStatus = 'partial';
+        request.requestSnapshotIntegrity = 'partial';
+        request.bodyCompleteness = 'unknown';
+        request.bodyCaptureSource = 'unavailable';
       }
+    }
+    if (postData !== undefined) {
+      request.bodyCompleteness = runtime.metadata.hasPostData
+        ? 'partial'
+        : 'complete';
+      request.bodyCaptureSource = 'cdp-postData-utf8';
+    }
+    const requestHeaders = runtime.metadata.headers;
+    const requestExtraHeaders = runtime.metadata.requestExtraInfo?.headers;
+    const responseHeaders = responseEvent?.response.headers ?? {};
+    const responseExtraHeaders = runtime.metadata.responseExtraInfo?.headers;
+    request.headersCompleteness =
+      requestExtraHeaders && (responseEvent ? responseExtraHeaders : true)
+        ? 'complete'
+        : 'partial';
+    request.requestSnapshotIntegrity =
+      request.headersCompleteness === 'complete' &&
+      request.bodyCompleteness !== 'unknown'
+        ? 'complete'
+        : 'partial';
+    const credentialArtifact = runtime.artifacts.get('request_headers');
+    if (credentialArtifact) {
+      credentialArtifact.descriptor.containsCredentials =
+        containsCredentialHeaders(requestHeaders) ||
+        Boolean(
+          requestExtraHeaders && containsCredentialHeaders(requestExtraHeaders),
+        );
+      credentialArtifact.descriptor.sensitivity = credentialArtifact.descriptor
+        .containsCredentials
+        ? 'credential'
+        : 'private';
     }
     await Promise.all([
       this.#writeArtifactOnce(
@@ -1493,8 +1845,58 @@ export class StreamCollector {
       this.#writeArtifactOnce(
         request,
         runtime,
-        'request_body',
+        'request_headers_extra',
+        Buffer.from(
+          `${JSON.stringify(runtime.metadata.requestExtraInfo ?? null, null, 2)}\n`,
+          'utf8',
+        ),
+      ),
+      this.#writeArtifactOnce(
+        request,
+        runtime,
+        'request_headers_redacted',
+        Buffer.from(
+          `${JSON.stringify(
+            {
+              headers: redactHeaders(requestHeaders),
+              extraHeaders: requestExtraHeaders
+                ? redactHeaders(requestExtraHeaders)
+                : undefined,
+              associatedCookieCount:
+                runtime.metadata.requestExtraInfo?.associatedCookies.length ??
+                0,
+            },
+            null,
+            2,
+          )}\n`,
+          'utf8',
+        ),
+      ),
+      this.#writeArtifactOnce(
+        request,
+        runtime,
+        'request_body_text',
         Buffer.from(postData ?? '', 'utf8'),
+      ),
+      this.#writeArtifactOnce(
+        request,
+        runtime,
+        'request_body_metadata',
+        Buffer.from(
+          `${JSON.stringify(
+            {
+              encoding: 'utf-8',
+              captureSource: request.bodyCaptureSource,
+              completeness: request.bodyCompleteness,
+              wireBytes: false,
+              hasPostData: runtime.metadata.hasPostData ?? false,
+              capturedChars: postData?.length ?? 0,
+            },
+            null,
+            2,
+          )}\n`,
+          'utf8',
+        ),
       ),
       this.#writeArtifactOnce(
         request,
@@ -1503,9 +1905,40 @@ export class StreamCollector {
         Buffer.from(
           `${JSON.stringify(
             {
-              status: responseEvent.response.status,
-              statusText: responseEvent.response.statusText,
-              headers: responseEvent.response.headers,
+              responseObserved: Boolean(responseEvent),
+              status: responseEvent?.response.status,
+              statusText: responseEvent?.response.statusText,
+              headers: responseHeaders,
+            },
+            null,
+            2,
+          )}\n`,
+          'utf8',
+        ),
+      ),
+      this.#writeArtifactOnce(
+        request,
+        runtime,
+        'response_headers_extra',
+        Buffer.from(
+          `${JSON.stringify(runtime.metadata.responseExtraInfo ?? null, null, 2)}\n`,
+          'utf8',
+        ),
+      ),
+      this.#writeArtifactOnce(
+        request,
+        runtime,
+        'response_headers_redacted',
+        Buffer.from(
+          `${JSON.stringify(
+            {
+              responseObserved: Boolean(responseEvent),
+              status: responseEvent?.response.status,
+              statusText: responseEvent?.response.statusText,
+              headers: redactHeaders(responseHeaders),
+              extraHeaders: responseExtraHeaders
+                ? redactHeaders(responseExtraHeaders)
+                : undefined,
             },
             null,
             2,
@@ -1539,6 +1972,8 @@ export class StreamCollector {
     runtime: RequestRuntime,
     responseMonotonicTimeSeconds: number,
   ): Promise<void> {
+    request.streamActivationAttempted = true;
+    request.failurePhase = 'activation';
     const cdpPromise = runtime.client.send('Network.streamResourceContent', {
       requestId: request.cdpRequestId,
     });
@@ -1568,6 +2003,7 @@ export class StreamCollector {
       ]);
       request.streamResourceContentEnabled = true;
       runtime.activationSucceeded = true;
+      request.rawCaptureIntegrity = 'partial';
       if (result.bufferedData) {
         const payload = Buffer.from(result.bufferedData, 'base64');
         this.#processChunk(request, runtime, {
@@ -1583,6 +2019,9 @@ export class StreamCollector {
         });
       }
     } catch (error) {
+      if (runtime.forceTerminated) {
+        return;
+      }
       const reason =
         runtime.activationFailureReason ??
         (getErrorText(error).includes('timed out')
@@ -1591,6 +2030,7 @@ export class StreamCollector {
       runtime.activationFailureReason = reason;
       request.streamResourceContentError = bounded(getErrorText(error));
       request.integrityStatus = 'failed';
+      request.rawCaptureIntegrity = 'failed';
       request.terminalReason ??= reason;
       if (reason === 'activation_timeout') {
         request.failure = {
@@ -1633,6 +2073,7 @@ export class StreamCollector {
       if (runtime.activationSucceeded) {
         request.status =
           request.status === 'activating' ? 'streaming' : request.status;
+        request.failurePhase = 'streaming';
         for (const pending of runtime.pendingChunks) {
           this.#processChunk(request, runtime, pending);
         }
@@ -1736,7 +2177,7 @@ export class StreamCollector {
     this.#queueArtifactAppend(
       request,
       runtime,
-      'raw_text',
+      'decoded_text',
       Buffer.from(rawText, 'utf8'),
     );
     this.#queueArtifactAppend(request, runtime, 'chunks', chunkLine);
@@ -1924,7 +2365,7 @@ export class StreamCollector {
           request.recentSemanticEvents.push(materialized.summary);
           this.#trimRecent(request.recentSemanticEvents);
         }
-        request.doneMarkerObserved ||= event.done;
+        request.defaultDoneMarkerObserved ||= event.defaultDoneMarker;
       } catch (error) {
         this.#markArtifactFailure(request, runtime, target, error);
       }
@@ -1944,7 +2385,7 @@ export class StreamCollector {
       eventId: event.eventId,
       retry: event.retry,
       comments: event.comments,
-      done: event.done,
+      defaultDoneMarker: event.defaultDoneMarker,
       source: event.source,
       invalidUtf8: event.invalidUtf8,
       dataLength: event.data.length,
@@ -1992,7 +2433,7 @@ export class StreamCollector {
         index: event.index,
         recordType: event.recordType,
         eventName: event.eventName,
-        done: event.done,
+        defaultDoneMarker: event.defaultDoneMarker,
         source: event.source,
         dataLength: event.data.length,
         payloadCount: payloads.length,
@@ -2021,7 +2462,7 @@ export class StreamCollector {
           chars: value.length,
           sha256: createHash('sha256').update(value, 'utf8').digest('hex'),
           sourceArtifactId: request.artifacts.find(
-            file => file.kind === 'raw_text',
+            file => file.kind === 'decoded_text',
           )?.artifactId,
         };
       }
@@ -2073,7 +2514,7 @@ export class StreamCollector {
         .slice(0, 12);
       const filename = `payload-${String(payloadIndex).padStart(6, '0')}-${pointerHash}.${candidate.extension}`;
       const artifact: StreamArtifactFile = {
-        artifactId: `stream-${runtime.capture.id}-request-${request.requestIndex + 1}-payload-${payloadIndex}`,
+        artifactId: `art_stream_${runtime.capture.uuid}_request_${request.requestIndex + 1}_payload_${payloadIndex}`,
         kind: 'payload',
         rootIndex: runtime.capture.artifactRootIndex,
         relativePath: toPortablePath(
@@ -2082,6 +2523,10 @@ export class StreamCollector {
         bytes: candidate.bytes.length,
         sha256: createHash('sha256').update(candidate.bytes).digest('hex'),
         mimeType: candidate.mimeType,
+        sensitivity: 'private',
+        containsCredentials: false,
+        encoding: 'binary',
+        captureSource: 'decoded-base64-event-field',
         writeStatus: 'pending',
       };
       payloads.push({
@@ -2150,14 +2595,34 @@ export class StreamCollector {
     runtime.finalizePromise = (async () => {
       try {
         await runtime.activationPromise;
+        if (runtime.forceTerminated) {
+          return;
+        }
+        if (!runtime.snapshotStarted) {
+          runtime.snapshotStarted = true;
+          const snapshotPromise = this.#writeNetworkSnapshot(
+            request,
+            runtime,
+            runtime.responseEvent,
+          );
+          void snapshotPromise.catch(() => undefined);
+          runtime.snapshotPromise = snapshotPromise;
+        }
         await runtime.snapshotPromise.catch(error => {
           request.writeErrors.push(
             bounded(`Network snapshot failed: ${getErrorText(error)}`) ??
               'Network snapshot failed.',
           );
-          request.integrityStatus = 'partial';
+          request.requestSnapshotIntegrity = 'partial';
+          request.failurePhase ??= 'finalize';
         });
+        if (runtime.forceTerminated) {
+          return;
+        }
         await runtime.writeChain;
+        if (runtime.forceTerminated) {
+          return;
+        }
       } catch (error) {
         request.writeErrors.push(
           bounded(`Finalize error: ${getErrorText(error)}`) ??
@@ -2178,7 +2643,7 @@ export class StreamCollector {
           this.#queueArtifactAppend(
             request,
             runtime,
-            'raw_text',
+            'decoded_text',
             finalTextBytes,
           );
           await runtime.writeChain;
@@ -2188,6 +2653,7 @@ export class StreamCollector {
       if (runtime.parser.degradedReason) {
         request.parseStatus = 'degraded';
         request.parseDegradedReason = bounded(runtime.parser.degradedReason);
+        request.semanticParseIntegrity = 'partial';
       }
       const terminal = runtime.terminal ?? {
         status: 'failed' as const,
@@ -2235,22 +2701,6 @@ export class StreamCollector {
     request: StreamRequest,
     runtime: RequestRuntime,
   ): void {
-    if (!runtime.activationSucceeded) {
-      if (
-        request.resourceType?.toLowerCase() === 'eventsource' &&
-        request.semanticEventCount > 0
-      ) {
-        request.integrityStatus = 'semantic-only';
-        request.primaryEventSource = 'eventsource';
-        request.parseStatus = 'raw-only';
-      } else {
-        request.integrityStatus = 'failed';
-        request.status = 'failed';
-        request.terminalReason =
-          runtime.activationFailureReason ?? 'activation_error';
-      }
-      return;
-    }
     const criticalFailed = request.artifacts.some(
       artifact =>
         artifact.writeStatus === 'failed' &&
@@ -2259,6 +2709,36 @@ export class StreamCollector {
     const supportingFailed = request.artifacts.some(
       artifact => artifact.writeStatus === 'failed',
     );
+    request.artifactIntegrity = criticalFailed
+      ? 'failed'
+      : supportingFailed
+        ? 'partial'
+        : 'complete';
+
+    if (!request.streamActivationAttempted) {
+      request.rawCaptureIntegrity = 'not-attempted';
+    } else if (!runtime.activationSucceeded) {
+      request.rawCaptureIntegrity = 'failed';
+    } else if (
+      request.failure?.code === 'DISK_QUOTA_EXCEEDED' ||
+      request.artifacts.find(artifact => artifact.kind === 'raw_bytes')
+        ?.writeStatus === 'failed'
+    ) {
+      request.rawCaptureIntegrity = 'failed';
+    } else if (request.truncation?.reason === 'disk_quota_exceeded') {
+      request.rawCaptureIntegrity = 'partial';
+    } else {
+      request.rawCaptureIntegrity = 'complete';
+    }
+
+    if (request.rawEventCount === 0 && request.semanticEventCount === 0) {
+      request.semanticParseIntegrity =
+        request.parseStatus === 'complete' ? 'not-attempted' : 'partial';
+    } else {
+      request.semanticParseIntegrity =
+        request.parseStatus === 'complete' ? 'complete' : 'partial';
+    }
+
     if (request.failure?.code === 'DISK_QUOTA_EXCEEDED') {
       request.integrityStatus = 'failed';
       request.status = 'failed';
@@ -2272,10 +2752,33 @@ export class StreamCollector {
       return;
     }
     if (
-      supportingFailed ||
-      request.parseStatus !== 'complete' ||
+      !runtime.activationSucceeded &&
+      request.resourceType?.toLowerCase() === 'eventsource' &&
+      request.semanticEventCount > 0
+    ) {
+      request.integrityStatus = 'semantic-only';
+      request.primaryEventSource = 'eventsource';
+      request.parseStatus = 'raw-only';
+      request.semanticParseIntegrity = 'complete';
+      return;
+    }
+    if (request.responseObserved && request.rawCaptureIntegrity === 'failed') {
+      request.integrityStatus = 'failed';
+      request.status = 'failed';
+      request.terminalReason =
+        runtime.activationFailureReason ??
+        request.terminalReason ??
+        'activation_error';
+      return;
+    }
+    if (
+      request.rawCaptureIntegrity === 'partial' ||
+      request.semanticParseIntegrity === 'partial' ||
+      request.requestSnapshotIntegrity === 'partial' ||
+      request.artifactIntegrity === 'partial' ||
       request.truncation ||
-      request.writeErrors.length > 0
+      request.writeErrors.length > 0 ||
+      !request.responseObserved
     ) {
       request.integrityStatus = 'partial';
       return;
@@ -2291,24 +2794,24 @@ export class StreamCollector {
       )
     ) {
       capture.integrityStatus = 'failed';
+      capture.collectorIntegrity = 'failed';
       capture.status = 'failed';
       return;
     }
     if (capture.requests.length === 0) {
       capture.integrityStatus =
         capture.status === 'failed' ? 'failed' : 'partial';
+      capture.collectorIntegrity = capture.integrityStatus;
       return;
     }
-    capture.integrityStatus = capture.requests.reduce<StreamIntegrityStatus>(
+    capture.collectorIntegrity = capture.requests.reduce<StreamIntegrityStatus>(
       (current, request) =>
         severity(request.integrityStatus) > severity(current)
           ? request.integrityStatus
           : current,
       'complete',
     );
-    if (capture.integrityStatus === 'failed') {
-      capture.status = 'failed';
-    }
+    capture.integrityStatus = capture.collectorIntegrity;
   }
 
   async #writeRequestMetadata(
@@ -2380,7 +2883,20 @@ export class StreamCollector {
   #requestSummaryForManifest(request: StreamRequest): Record<string, unknown> {
     return {
       cdpRequestId: request.cdpRequestId,
+      persistentRequestId: request.persistentRequestId,
       networkRequestId: request.networkRequestId,
+      networkRequestIdLifetime: request.networkRequestIdLifetime,
+      collectorGeneration: request.collectorGeneration,
+      requestStartedBeforeCapture: request.requestStartedBeforeCapture,
+      responseObserved: request.responseObserved,
+      streamActivationAttempted: request.streamActivationAttempted,
+      failurePhase: request.failurePhase,
+      captureScope: request.captureScope,
+      workerCoverage: request.workerCoverage,
+      targetType: request.targetType,
+      frameId: request.frameId,
+      loaderId: request.loaderId,
+      fromServiceWorker: request.fromServiceWorker,
       requestIndex: request.requestIndex,
       url: request.url,
       method: request.method,
@@ -2391,6 +2907,13 @@ export class StreamCollector {
       status: request.status,
       terminalReason: request.terminalReason,
       integrityStatus: request.integrityStatus,
+      rawCaptureIntegrity: request.rawCaptureIntegrity,
+      semanticParseIntegrity: request.semanticParseIntegrity,
+      requestSnapshotIntegrity: request.requestSnapshotIntegrity,
+      artifactIntegrity: request.artifactIntegrity,
+      headersCompleteness: request.headersCompleteness,
+      bodyCompleteness: request.bodyCompleteness,
+      bodyCaptureSource: request.bodyCaptureSource,
       parseStatus: request.parseStatus,
       parseDegradedReason: request.parseDegradedReason,
       startedMonotonicTimeSeconds: request.startedMonotonicTimeSeconds,
@@ -2405,7 +2928,7 @@ export class StreamCollector {
       rawEventCount: request.rawEventCount,
       semanticEventCount: request.semanticEventCount,
       primaryEventSource: request.primaryEventSource,
-      doneMarkerObserved: request.doneMarkerObserved,
+      defaultDoneMarkerObserved: request.defaultDoneMarkerObserved,
       invalidUtf8Count: request.invalidUtf8Count,
       incompleteTailBytes: request.incompleteTailBytes,
       rawBytes: request.rawBytes,
@@ -2418,8 +2941,16 @@ export class StreamCollector {
   #captureManifest(capture: StreamCapture): Record<string, unknown> {
     return {
       captureId: capture.id,
+      captureUuid: capture.uuid,
       status: capture.status,
       integrityStatus: capture.integrityStatus,
+      collectorIntegrity: capture.collectorIntegrity,
+      collectorGeneration: capture.collectorGeneration,
+      captureArmedMonotonicTimeSeconds:
+        capture.captureArmedMonotonicTimeSeconds,
+      includeInFlight: capture.includeInFlight,
+      captureScope: capture.captureScope,
+      workerCoverage: capture.workerCoverage,
       filter: capture.filter,
       artifactRootIndex: capture.artifactRootIndex,
       relativeDir: capture.relativeDir,
@@ -2697,6 +3228,7 @@ export class StreamCollector {
     page: Page,
     filter: StreamCaptureFilter,
     location: StreamCaptureLocation,
+    options: StreamCaptureOptions = {},
   ): Promise<StreamCapture> {
     const active = this.#activeCaptureByPage.get(page);
     if (active && ['armed', 'capturing'].includes(active.status)) {
@@ -2705,19 +3237,31 @@ export class StreamCollector {
       );
     }
     const id = this.#nextCaptureId++;
+    const uuid = randomUUID();
+    const collectorGeneration = (this.#pageGeneration.get(page) ?? 0) + 1;
+    this.#pageGeneration.set(page, collectorGeneration);
     const relativeDir = toPortablePath(location.relativeDir);
     const metadataArtifact: StreamArtifactFile = {
-      artifactId: `stream-${id}-capture-metadata`,
+      artifactId: `art_stream_${uuid}_capture_metadata`,
       kind: 'capture_metadata',
       rootIndex: location.rootIndex,
       relativePath: toPortablePath(path.join(relativeDir, 'capture.json')),
       bytes: 0,
       writeStatus: 'pending',
+      sensitivity: 'private',
+      containsCredentials: false,
     };
     const capture: StreamCapture = {
       id,
+      uuid,
       status: 'armed',
       integrityStatus: 'partial',
+      collectorIntegrity: 'partial',
+      collectorGeneration,
+      captureArmedMonotonicTimeSeconds: this.#latestMonotonicTime.get(page),
+      includeInFlight: options.includeInFlight ?? false,
+      captureScope: 'page-target-only',
+      workerCoverage: false,
       filter: normalizeFilter(filter),
       artifactRootIndex: location.rootIndex,
       relativeDir,
@@ -2758,8 +3302,13 @@ export class StreamCollector {
 
   async stopCapture(
     captureId: number,
-    reason: StreamTerminalReason = 'collector_stop',
+    options: {
+      reason?: StreamTerminalReason;
+      signal?: AbortSignal;
+      deadlineWallTimeMs?: number;
+    } = {},
   ): Promise<StreamCapture> {
+    const reason = options.reason ?? 'collector_stop';
     const capture = this.getById(captureId);
     const runtime = this.#captureRuntime.get(capture);
     if (!runtime) {
@@ -2798,17 +3347,113 @@ export class StreamCollector {
             : undefined,
       };
     }
-    await Promise.all(
+    const finalizePromise = Promise.all(
       capture.requests.map(request => this.#finalizeRequest(request)),
     );
+    try {
+      await this.#awaitFinalizeDeadline(finalizePromise, options);
+    } catch (error) {
+      await this.#forceFinalizeCapture(capture, getErrorText(error));
+    }
     this.#recomputeCaptureIntegrity(capture);
     await this.#queueCaptureMetadata(capture);
     return capture;
   }
 
+  async #awaitFinalizeDeadline(
+    promise: Promise<unknown>,
+    options: {signal?: AbortSignal; deadlineWallTimeMs?: number},
+  ): Promise<void> {
+    const signal = options.signal;
+    signal?.throwIfAborted();
+    const remaining = options.deadlineWallTimeMs
+      ? options.deadlineWallTimeMs - Date.now()
+      : undefined;
+    if (remaining !== undefined && remaining <= 0) {
+      throw new Error('Stream finalization deadline already expired.');
+    }
+    let timeout: ReturnType<typeof setTimeout> | undefined;
+    let abortListener: (() => void) | undefined;
+    const deadlinePromise =
+      remaining === undefined
+        ? undefined
+        : new Promise<never>((_, reject) => {
+            timeout = setTimeout(
+              () => reject(new Error('Stream finalization deadline exceeded.')),
+              remaining,
+            );
+          });
+    const abortPromise = signal
+      ? new Promise<never>((_, reject) => {
+          abortListener = () =>
+            reject(
+              signal.reason instanceof Error
+                ? signal.reason
+                : new Error('Stream finalization aborted.'),
+            );
+          signal.addEventListener('abort', abortListener, {once: true});
+        })
+      : undefined;
+    try {
+      await Promise.race(
+        [promise, deadlinePromise, abortPromise].filter(
+          (candidate): candidate is Promise<unknown> => Boolean(candidate),
+        ),
+      );
+    } finally {
+      if (timeout) {
+        clearTimeout(timeout);
+      }
+      if (signal && abortListener) {
+        signal.removeEventListener('abort', abortListener);
+      }
+    }
+  }
+
+  async #forceFinalizeCapture(
+    capture: StreamCapture,
+    errorText: string,
+  ): Promise<void> {
+    capture.status = 'failed';
+    capture.integrityStatus = 'failed';
+    capture.collectorIntegrity = 'failed';
+    capture.stoppedWallTimeMs ??= Date.now();
+    capture.errors.push(
+      bounded(`Stream finalization interrupted: ${errorText}`) ??
+        'Stream finalization interrupted.',
+    );
+    for (const request of capture.requests) {
+      const runtime = this.#requestRuntime.get(request);
+      if (!runtime || runtime.finalized) {
+        continue;
+      }
+      runtime.forceTerminated = true;
+      runtime.activationAbort.abort(
+        new Error('Stream finalization interrupted'),
+      );
+      request.status = 'failed';
+      request.terminalReason = 'finalize_timeout';
+      request.failurePhase = 'finalize';
+      request.integrityStatus = 'failed';
+      request.artifactIntegrity = 'partial';
+      request.failure = {
+        errorText:
+          bounded(`Stream finalization interrupted: ${errorText}`) ??
+          'Stream finalization interrupted.',
+        canceled: false,
+        code: 'FINALIZE_TIMEOUT',
+      };
+      await this.#closeRequestHandles(runtime);
+      runtime.finalized = true;
+      await this.#writeRequestMetadata(request, runtime).catch(() => undefined);
+    }
+  }
+
   async #handlePageClosed(page: Page): Promise<void> {
     const captures = [...this.#captures.values()].filter(
-      capture => this.#captureRuntime.get(capture)?.page === page,
+      capture =>
+        this.#captureRuntime.get(capture)?.page === page &&
+        ['armed', 'capturing'].includes(capture.status),
     );
     for (const capture of captures) {
       capture.status = 'failed';
@@ -2857,7 +3502,12 @@ export class StreamCollector {
     );
     let timeout: ReturnType<typeof setTimeout> | undefined;
     const cleanup = Promise.all(
-      active.map(capture => this.stopCapture(capture.id, 'collector_stop')),
+      active.map(capture =>
+        this.stopCapture(capture.id, {
+          reason: 'collector_stop',
+          deadlineWallTimeMs: Date.now() + timeoutMs,
+        }),
+      ),
     ).then(() => false);
     const timedOut = await Promise.race([
       cleanup,
