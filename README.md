@@ -164,16 +164,16 @@ npm run build
 
 ### 网络、流式响应与 WebSocket
 
-| 工具                     | 描述                                                        |
-| ------------------------ | ----------------------------------------------------------- |
-| `list_network_requests`  | 列出网络请求、查看详情，或导出 header/body/query 等原始材料 |
-| `clear_network_requests` | 显式确认后清空当前页面已收集的请求和 body cache             |
-| `get_request_initiator`  | 获取网络请求的 JavaScript 调用栈                            |
-| `start_stream_capture`   | 在操作前启用 fetch/XHR SSE 与 EventSource 流捕获            |
-| `get_stream_chunks`      | 按顺序查看 SSE 事件或原始 chunk 元数据                      |
-| `stop_stream_capture`    | 停止并冻结当前流捕获，不取消浏览器请求                      |
-| `export_stream_capture`  | 导出完整原始流字节或包含事件、chunk 和状态的 JSON           |
-| `get_websocket_messages` | 列出 WebSocket 连接、分析消息模式或获取消息详情             |
+| 工具                     | 描述                                                         |
+| ------------------------ | ------------------------------------------------------------ |
+| `list_network_requests`  | 列出网络请求、查看详情，或导出 header/body/query 等原始材料  |
+| `clear_network_requests` | 显式确认后清空当前页面已收集的请求和 body cache              |
+| `get_request_initiator`  | 获取网络请求的 JavaScript 调用栈                             |
+| `start_stream_capture`   | 在操作前把 fetch/XHR SSE 与 EventSource 流解码并写入工作目录 |
+| `get_stream_status`      | 查看状态、文件路径和可选 chunk offset，不返回事件正文        |
+| `stop_stream_capture`    | 停止捕获、刷新增量解析并写完 metadata                        |
+| `export_stream_capture`  | 刷新文件并返回 artifact 索引，不返回 Base64 或大正文         |
+| `get_websocket_messages` | 列出 WebSocket 连接、分析消息模式或获取消息详情              |
 
 ### 浏览器状态
 
@@ -227,11 +227,12 @@ npm run build
 流捕获不是追溯式的，应在触发页面操作前启动：
 
 ```text
-1. start_stream_capture：按 URL、method、resource type 或 MIME 缩小范围
+1. start_stream_capture：指定新的工作目录，并按 URL、method、resource type 或 MIME 缩小范围
 2. 在页面中触发 fetch/XHR/EventSource 请求
-3. get_stream_chunks：查看有序 SSE 事件、[DONE] 和 chunk 时间
-4. stop_stream_capture：冻结结果
-5. export_stream_capture：需要完整字节证据时导出 raw 或 JSON
+3. get_stream_status：查看完成状态、事件计数、文件路径和可选 chunk offset
+4. stop_stream_capture：停止并刷新 raw.bin、raw.sse、events.jsonl、chunks.jsonl 和 metadata
+5. export_stream_capture：返回 artifact 文件索引
+6. 使用 workspace 文件工具读取、搜索和分析 events.jsonl / raw.sse
 ```
 
 ### Agent 推荐的完整捕获流程

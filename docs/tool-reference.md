@@ -21,7 +21,7 @@ content is kept for human-readable compatibility.
 - **[Network](#network)** (7 tools)
   - [`clear_network_requests`](#clear_network_requests)
   - [`export_stream_capture`](#export_stream_capture)
-  - [`get_stream_chunks`](#get_stream_chunks)
+  - [`get_stream_status`](#get_stream_status)
   - [`get_websocket_messages`](#get_websocket_messages)
   - [`list_network_requests`](#list_network_requests)
   - [`start_stream_capture`](#start_stream_capture)
@@ -124,29 +124,26 @@ content is kept for human-readable compatibility.
 
 ### `export_stream_capture`
 
-**Description:** Export exact retained streaming-response evidence to a local file. Use format="raw" for the concatenated response bytes of one request, or format="json" for capture metadata, chunk base64, EventSource messages, and parsed SSE events. Subject to --allowedRoots.
+**Description:** Flush current streaming evidence to disk and return only the artifact file index. Raw bytes, SSE text, JSONL events, chunk metadata, and extracted binary payloads are already stored under the capture output directory; this tool never returns their contents or Base64 through MCP.
 
 **Parameters:**
 
 - **captureId** (integer) **(required)**
-- **confirmOverwrite** (boolean) _(optional)_
-- **format** (enum: "raw", "json") _(optional)_
-- **outputFile** (string) **(required)**
-- **requestId** (string) _(optional)_: Required for raw export when a capture contains multiple requests. Optional for JSON export.
+- **requestId** (string) _(optional)_: Optional requestId to return only files for one matched stream request.
 
 ---
 
-### `get_stream_chunks`
+### `get_stream_status`
 
-**Description:** Inspect a previously armed streaming-response capture. Without requestId it lists matched streaming requests. With requestId it returns parsed SSE events, raw chunk metadata, or both. Parsed events preserve order and identify [DONE]; native EventSource messages are used as a fallback when raw bytes are unavailable. Exact bytes should be exported with [`export_stream_capture`](#export_stream_capture).
+**Description:** Inspect small status and file-index metadata for a streaming capture. It never returns CDP Base64 or full SSE event bodies. Without requestId it lists matched requests. With requestId it returns request status, artifact paths, recent event summaries, and optionally paginated chunk offsets/timing. Read events.jsonl, raw.sse, or payload files with local workspace tools.
 
 **Parameters:**
 
 - **captureId** (integer) **(required)**
+- **includeChunks** (boolean) _(optional)_: Return paginated chunk timing and raw.bin byte offsets. Chunk payload bytes are never returned.
 - **pageIdx** (integer) _(optional)_
 - **pageSize** (integer) _(optional)_
 - **requestId** (string) _(optional)_: CDP requestId from the capture request list. Omit to list matched requests.
-- **view** (enum: "events", "chunks", "all") _(optional)_: With requestId, return parsed SSE events, raw chunk metadata, or both.
 
 ---
 
@@ -190,12 +187,13 @@ content is kept for human-readable compatibility.
 
 ### `start_stream_capture`
 
-**Description:** Arm streaming HTTP response capture for the selected page before reproducing an action. It uses Network.streamResourceContent so fetch/XHR text-event-stream bytes are retained during delivery, and also records native EventSource messages. Only one capture may be active per selected page. The default MIME filter is text/event-stream; narrow with URL, method, resource type, or MIME filters. Follow with [`get_stream_chunks`](#get_stream_chunks), then [`stop_stream_capture`](#stop_stream_capture).
+**Description:** Arm streaming HTTP response capture for the selected page before reproducing an action. CDP Base64 is decoded immediately and written under outputDir as raw bytes, decoded SSE text, chunk JSONL, event JSONL, metadata, and extracted binary payload files. The output directory must not already exist and is subject to --allowedRoots. No large Base64 or event body is returned through MCP.
 
 **Parameters:**
 
 - **methods** (array) _(optional)_: Optional HTTP method filter, such as ["POST"].
 - **mimeTypes** (array) _(optional)_: Response MIME prefixes to capture. Defaults to ["text/event-stream"]. Pass explicit values for NDJSON or another streaming format.
+- **outputDir** (string) **(required)**: New directory for capture files. It must not already exist and is subject to --allowedRoots.
 - **resourceTypes** (array) _(optional)_: Optional CDP/Playwright resource-type filter, such as ["fetch","eventsource"].
 - **urlFilter** (string) _(optional)_: Only capture response URLs containing this substring.
 
@@ -203,7 +201,7 @@ content is kept for human-readable compatibility.
 
 ### `stop_stream_capture`
 
-**Description:** Stop an armed stream capture for the selected page. This freezes the retained bytes and semantic events but does not cancel the browser request. Call after the reproduced action has completed or after the desired cancellation/error state was observed.
+**Description:** Stop an armed stream capture, flush incremental UTF-8/SSE parsing, and finalize request/capture metadata files. This does not cancel the browser request. Use after completion, failure, cancellation, or the desired partial-stream state has been observed.
 
 **Parameters:**
 

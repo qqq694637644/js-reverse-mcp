@@ -16,11 +16,7 @@ import type {TrafficSummary} from './formatters/websocketFormatter.js';
 import {assertLocalFileWriteAllowed} from './LocalFileAccess.js';
 import {NetworkCollector, ConsoleCollector} from './PageCollector.js';
 import type {ListenerMap, RequestInitiator} from './PageCollector.js';
-import type {
-  StreamCapture,
-  StreamCaptureFilter,
-  StreamRequest,
-} from './StreamCollector.js';
+import type {StreamCapture, StreamCaptureFilter} from './StreamCollector.js';
 import {StreamCollector} from './StreamCollector.js';
 import type {
   BrowserContext,
@@ -365,24 +361,61 @@ export class McpContext implements Context {
     return this.#networkCollector.getById(this.getSelectedPage(), reqid);
   }
 
-  startStreamCapture(filter: StreamCaptureFilter): StreamCapture {
-    return this.#streamCollector.startCapture(this.getSelectedPage(), filter);
+  async startStreamCapture(
+    filter: StreamCaptureFilter,
+    outputDir: string,
+  ): Promise<StreamCapture> {
+    let resolvedOutputDir = path.resolve(outputDir);
+    try {
+      resolvedOutputDir = assertLocalFileWriteAllowed(resolvedOutputDir);
+      await fs.mkdir(resolvedOutputDir, {mode: 0o700});
+    } catch (error) {
+      if (error instanceof ToolError) {
+        throw error;
+      }
+      if (
+        typeof error === 'object' &&
+        error !== null &&
+        'code' in error &&
+        error.code === 'EEXIST'
+      ) {
+        throw new ToolError(
+          'CONFIRMATION_REQUIRED',
+          `Stream output directory already exists: ${resolvedOutputDir}. Choose a new directory so evidence is never mixed or overwritten.`,
+          {cause: error},
+        );
+      }
+      throw new ToolError(
+        'IO_ERROR',
+        `Could not create stream output directory: ${resolvedOutputDir}`,
+        {cause: error},
+      );
+    }
+    try {
+      return this.#streamCollector.startCapture(
+        this.getSelectedPage(),
+        filter,
+        resolvedOutputDir,
+      );
+    } catch (error) {
+      await fs.rmdir(resolvedOutputDir).catch(() => undefined);
+      throw error;
+    }
   }
 
   getStreamCapture(captureId: number): StreamCapture {
     return this.#streamCollector.getById(this.getSelectedPage(), captureId);
   }
 
-  stopStreamCapture(captureId: number): StreamCapture {
+  async stopStreamCapture(captureId: number): Promise<StreamCapture> {
     return this.#streamCollector.stopCapture(this.getSelectedPage(), captureId);
   }
 
-  getStreamRawBody(request: StreamRequest): Uint8Array<ArrayBufferLike> {
-    return this.#streamCollector.getRawBody(request);
-  }
-
-  getStreamSseEvents(request: StreamRequest) {
-    return this.#streamCollector.getSseEvents(request);
+  async flushStreamCapture(captureId: number): Promise<StreamCapture> {
+    return this.#streamCollector.flushCapture(
+      this.getSelectedPage(),
+      captureId,
+    );
   }
 
   getDialog(): Dialog | undefined {

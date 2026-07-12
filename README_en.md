@@ -169,10 +169,10 @@ When to enable `--cloak`: only for sites that block you on fingerprint despite a
 | `list_network_requests`  | List requests, inspect one request, or export raw headers/body/query material  |
 | `clear_network_requests` | Clear the selected page's collected requests and body cache after confirmation |
 | `get_request_initiator`  | Get JavaScript call stack for a network request                                |
-| `start_stream_capture`   | Arm fetch/XHR SSE and native EventSource capture before an action              |
-| `get_stream_chunks`      | Inspect ordered SSE events or raw chunk metadata                               |
-| `stop_stream_capture`    | Stop and freeze a capture without cancelling the browser request               |
-| `export_stream_capture`  | Export exact raw stream bytes or JSON containing events, chunks, and status    |
+| `start_stream_capture`   | Decode fetch/XHR SSE and EventSource streams into a workspace directory        |
+| `get_stream_status`      | Inspect status, file paths, and optional chunk offsets without event bodies    |
+| `stop_stream_capture`    | Stop capture, flush incremental parsing, and finalize metadata                 |
+| `export_stream_capture`  | Flush files and return the artifact index without Base64 or large bodies       |
 | `get_websocket_messages` | List WebSocket connections, analyze messages, or get message details           |
 
 ### Browser State
@@ -227,11 +227,12 @@ List WebSocket connections, analyze message patterns, view messages of specific 
 Stream capture is not retroactive, so arm it before triggering the page action:
 
 ```text
-1. start_stream_capture: narrow by URL, method, resource type, or MIME
+1. start_stream_capture: choose a new workspace directory and narrow by URL, method, resource type, or MIME
 2. Trigger the fetch/XHR/EventSource request in the page
-3. get_stream_chunks: inspect ordered SSE events, [DONE], and chunk timing
-4. stop_stream_capture: freeze the result
-5. export_stream_capture: export raw bytes or JSON when exact evidence is needed
+3. get_stream_status: inspect completion, event counts, file paths, and optional chunk offsets
+4. stop_stream_capture: finalize raw.bin, raw.sse, events.jsonl, chunks.jsonl, and metadata
+5. export_stream_capture: return the artifact file index
+6. Use workspace file tools to read, search, and analyze events.jsonl or raw.sse
 ```
 
 ### Agent-Friendly Full Capture Flow

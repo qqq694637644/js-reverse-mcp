@@ -245,9 +245,10 @@
     {
       "id": "start-sse-capture",
       "category": "streaming",
-      "prompt": "Before I submit the next chat message, arm streaming response capture for POST fetch requests whose URL contains /conversation.",
+      "prompt": "Before I submit the next chat message, arm streaming response capture under the new directory /tmp/conversation-stream for POST fetch requests whose URL contains /conversation.",
       "expectedTool": "start_stream_capture",
       "expectedArgs": {
+        "outputDir": "/tmp/conversation-stream",
         "urlFilter": "/conversation",
         "methods": ["POST"],
         "resourceTypes": ["fetch"]
@@ -256,12 +257,12 @@
     {
       "id": "inspect-sse-events",
       "category": "streaming",
-      "prompt": "Stream capture 4 contains request 123.4. Return its parsed SSE events in order, including the ending marker.",
-      "expectedTool": "get_stream_chunks",
+      "prompt": "Stream capture 4 contains request 123.4. Show its completion status, artifact paths, and paginated chunk offsets without returning event bodies.",
+      "expectedTool": "get_stream_status",
       "expectedArgs": {
         "captureId": 4,
         "requestId": "123.4",
-        "view": "events"
+        "includeChunks": true
       }
     },
     {
@@ -274,13 +275,11 @@
     {
       "id": "export-sse-bytes",
       "category": "streaming",
-      "prompt": "Export the exact retained raw bytes for request 123.4 from stream capture 4 to the new file /tmp/conversation.sse.",
+      "prompt": "Flush stream capture 4 and return the artifact file index for request 123.4; do not return raw bytes or Base64 inline.",
       "expectedTool": "export_stream_capture",
       "expectedArgs": {
         "captureId": 4,
-        "requestId": "123.4",
-        "format": "raw",
-        "outputFile": "/tmp/conversation.sse"
+        "requestId": "123.4"
       }
     }
   ]

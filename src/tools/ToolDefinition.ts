@@ -7,12 +7,7 @@
 import type {DebuggerContext} from '../DebuggerContext.js';
 import type {TrafficSummary} from '../formatters/websocketFormatter.js';
 import type {RequestInitiator} from '../PageCollector.js';
-import type {
-  SseEvent,
-  StreamCapture,
-  StreamCaptureFilter,
-  StreamRequest,
-} from '../StreamCollector.js';
+import type {StreamCapture, StreamCaptureFilter} from '../StreamCollector.js';
 import {zod} from '../third_party/index.js';
 import type {Dialog, Frame, HTTPRequest, Page} from '../third_party/index.js';
 import {TOOL_ERROR_CODES} from '../ToolError.js';
@@ -200,14 +195,13 @@ export type Context = Readonly<{
    * dropped so the caller can report it.
    */
   clearNetworkRequests(): {requestCount: number; reclaimedBytes: number};
-  startStreamCapture(filter: StreamCaptureFilter): StreamCapture;
+  startStreamCapture(
+    filter: StreamCaptureFilter,
+    outputDir: string,
+  ): Promise<StreamCapture>;
   getStreamCapture(captureId: number): StreamCapture;
-  stopStreamCapture(captureId: number): StreamCapture;
-  getStreamRawBody(request: StreamRequest): Uint8Array<ArrayBufferLike>;
-  getStreamSseEvents(request: StreamRequest): {
-    events: SseEvent[];
-    incompleteTail: string;
-  };
+  stopStreamCapture(captureId: number): Promise<StreamCapture>;
+  flushStreamCapture(captureId: number): Promise<StreamCapture>;
   /**
    * Get all WebSocket connections for the selected page.
    */
