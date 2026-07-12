@@ -204,6 +204,7 @@ function emitRequestStart(
       statusText: string;
       headers: Record<string, string>;
     };
+    redirectHasExtraInfo?: boolean;
     emitResponse?: boolean;
     frameId?: string;
     loaderId?: string;
@@ -222,6 +223,7 @@ function emitRequestStart(
     loaderId: options.loaderId ?? 'loader-1',
     initiator: options.initiator ?? {type: 'script'},
     redirectResponse: options.redirectResponse,
+    redirectHasExtraInfo: options.redirectHasExtraInfo,
     request: {
       url,
       method,
@@ -258,6 +260,7 @@ function emitResponse(
     frameId?: string;
     loaderId?: string;
     fromServiceWorker?: boolean;
+    hasExtraInfo?: boolean;
   } = {},
 ): void {
   session.emit('Network.responseReceived', {
@@ -266,6 +269,7 @@ function emitResponse(
     type: options.type ?? 'Fetch',
     frameId: options.frameId ?? 'frame-1',
     loaderId: options.loaderId ?? 'loader-1',
+    hasExtraInfo: options.hasExtraInfo,
     response: {
       url: options.url ?? 'https://example.test/api/stream',
       mimeType: options.mimeType ?? 'text/event-stream',
@@ -1347,7 +1351,8 @@ test('ExtraInfo snapshot records credentials privately and writes a redacted vie
     assert.equal(request.headersCompleteness, 'complete');
     assert.equal(request.bodyCompleteness, 'partial');
     assert.equal(request.bodyCaptureSource, 'cdp-postData-utf8');
-    assert.equal(request.requestSnapshotIntegrity, 'complete');
+    assert.equal(request.requestSnapshotIntegrity, 'partial');
+    assert.equal(request.replayReadiness, 'partial');
     const byKind = (kind: string) =>
       request.artifacts.find(artifact => artifact.kind === kind)!;
     const fullHeaders = byKind('request_headers');
@@ -1373,6 +1378,234 @@ test('ExtraInfo snapshot records credentials privately and writes a redacted vie
     assert.equal(bodyMeta.wireBytes, false);
     assert.equal(bodyMeta.captureSource, 'cdp-postData-utf8');
     assert.equal(bodyMeta.encoding, 'utf-8');
+  } finally {
+    await collector.dispose();
+    await fs.rm(root, {recursive: true, force: true});
+  }
+});
+
+test('event predicate matching survives recent-event eviction and supports JSON paths', async () => {
+  const {collector, addPage} = createFixture({
+    collectorOptions: {maxRecentEventsPerRequest: 10},
+  });
+  const control = addPage();
+  const {root, location} = await createLocation('predicate-after-eviction');
+  try {
+    await collector.addPage(control.page);
+    const capture = await collector.startCapture(control.page, {}, location);
+    const requestId = emitRequestStart(control.session);
+    await flushMicrotasks();
+    const largeValue = 'x'.repeat(10_000);
+    const largeJson = JSON.stringify({type: 'large', value: largeValue});
+    const events = [
+      'data: special-target\n\n',
+      'data: {"type":"needle","sequence":1}\n\n',
+      `data: ${largeJson}\n\n`,
+      ...Array.from(
+        {length: 50},
+        (_, index) => `data: {"type":"noise","sequence":${index + 3}}\n\n`,
+      ),
+    ].join('');
+    emitText(control.session, requestId, events, 3);
+    const exact = await collector.findEventMatch(capture.id, {
+      requestId,
+      afterEventIndex: -1,
+      predicate: {type: 'exact_data', value: 'special-target'},
+    });
+    const json = await collector.findEventMatch(capture.id, {
+      requestId,
+      afterEventIndex: 0,
+      predicate: {
+        type: 'json_path_equals',
+        path: '$.type',
+        value: 'needle',
+      },
+    });
+    const exactJson = await collector.findEventMatch(capture.id, {
+      requestId,
+      afterEventIndex: 0,
+      predicate: {
+        type: 'exact_data',
+        value: '{"type":"needle","sequence":1}',
+      },
+    });
+    const exactLarge = await collector.findEventMatch(capture.id, {
+      requestId,
+      afterEventIndex: 1,
+      predicate: {type: 'exact_data', value: largeJson},
+    });
+    const largeJsonPath = await collector.findEventMatch(capture.id, {
+      requestId,
+      afterEventIndex: 1,
+      predicate: {
+        type: 'json_path_equals',
+        path: '$.value',
+        value: largeValue,
+      },
+    });
+    assert.deepEqual(exact, {
+      matched: true,
+      matchedEventIndex: 0,
+      matchedRequestId: requestId,
+      matchedSource: 'raw-stream',
+    });
+    assert.equal(json.matched, true);
+    assert.equal(json.matchedEventIndex, 1);
+    assert.equal(exactJson.matchedEventIndex, 1);
+    assert.equal(exactLarge.matchedEventIndex, 2);
+    assert.equal(largeJsonPath.matchedEventIndex, 2);
+    assert.equal(capture.requests[0].recentRawEvents.length, 10);
+    assert.equal(
+      capture.requests[0].recentRawEvents.some(event => event.index === 0),
+      false,
+    );
+    const afterTarget = await collector.findEventMatch(capture.id, {
+      requestId,
+      afterEventIndex: 0,
+      predicate: {type: 'exact_data', value: 'special-target'},
+    });
+    assert.deepEqual(afterTarget, {matched: false});
+  } finally {
+    await collector.dispose();
+    await fs.rm(root, {recursive: true, force: true});
+  }
+});
+
+test('capture version advances for semantic events, terminal state, and finalize', async () => {
+  const {collector, addPage} = createFixture({
+    streamResourceContent: async () => {
+      throw new Error('raw stream unavailable');
+    },
+  });
+  const control = addPage();
+  const {root, location} = await createLocation('visible-version');
+  try {
+    await collector.addPage(control.page);
+    const capture = await collector.startCapture(control.page, {}, location);
+    const armedVersion = capture.version;
+    const requestId = emitRequestStart(control.session, {
+      method: 'GET',
+      type: 'EventSource',
+    });
+    await flushMicrotasks();
+    const requestVersion = capture.version;
+    control.session.emit('Network.eventSourceMessageReceived', {
+      requestId,
+      timestamp: 3,
+      eventName: 'message',
+      eventId: '1',
+      data: '{"type":"semantic"}',
+    });
+    await collector.findEventMatch(capture.id, {
+      requestId,
+      predicate: {
+        type: 'json_path_equals',
+        path: '$.type',
+        value: 'semantic',
+      },
+    });
+    const semanticVersion = capture.version;
+    emitFinished(control.session, requestId, 4);
+    const terminalVersion = capture.version;
+    await collector.stopCapture(capture.id);
+    const finalizedVersion = capture.version;
+    assert.ok(requestVersion > armedVersion);
+    assert.ok(semanticVersion > requestVersion);
+    assert.ok(terminalVersion > semanticVersion);
+    assert.ok(finalizedVersion > terminalVersion);
+  } finally {
+    await collector.dispose();
+    await fs.rm(root, {recursive: true, force: true});
+  }
+});
+
+test('capture armed wall time reflects the actual start call', async () => {
+  const {collector, addPage} = createFixture();
+  const control = addPage();
+  const {root, location} = await createLocation('armed-wall-time');
+  try {
+    await collector.addPage(control.page);
+    const before = Date.now();
+    const capture = await collector.startCapture(control.page, {}, location);
+    const after = Date.now();
+    assert.ok(capture.captureArmedWallTimeMs >= before);
+    assert.ok(capture.captureArmedWallTimeMs <= after);
+  } finally {
+    await collector.dispose();
+    await fs.rm(root, {recursive: true, force: true});
+  }
+});
+
+test('redirect ExtraInfo queues all hops and waits for a late final hop', async () => {
+  const {collector, addPage} = createFixture({
+    requestPostData: '{"hello":1}',
+    collectorOptions: {extraInfoWaitMs: 250},
+  });
+  const control = addPage();
+  const {root, location} = await createLocation('redirect-extra-info');
+  try {
+    await collector.addPage(control.page);
+    const capture = await collector.startCapture(control.page, {}, location);
+    const requestId = emitRequestStart(control.session, {
+      requestId: 'redirect-stream',
+      url: 'https://example.test/redirect',
+      emitResponse: false,
+      hasPostData: true,
+    });
+    emitRequestExtraInfo(control.session, requestId, {
+      cookie: 'hop=one',
+    });
+    emitResponseExtraInfo(control.session, requestId, {
+      location: '/api/stream',
+      'set-cookie': 'hop=two',
+    });
+    emitRequestStart(control.session, {
+      requestId,
+      url: 'https://example.test/api/stream',
+      emitResponse: false,
+      hasPostData: true,
+      redirectHasExtraInfo: true,
+      redirectResponse: {
+        url: 'https://example.test/redirect',
+        status: 307,
+        statusText: 'Temporary Redirect',
+        headers: {location: '/api/stream'},
+      },
+    });
+    emitRequestExtraInfo(control.session, requestId, {
+      cookie: 'hop=two',
+      authorization: 'Bearer final-hop',
+    });
+    emitResponse(control.session, requestId, {hasExtraInfo: true});
+    await flushMicrotasks();
+    emitText(control.session, requestId, 'data: [DONE]\n\n', 3);
+    emitFinished(control.session, requestId, 4);
+    setTimeout(() => {
+      emitResponseExtraInfo(control.session, requestId, {
+        'content-type': 'text/event-stream',
+        'set-cookie': 'hop=done',
+      });
+    }, 20);
+    await collector.stopCapture(capture.id);
+
+    const request = capture.requests[0];
+    assert.equal(request.headersCompleteness, 'complete');
+    assert.equal(request.requestSnapshotIntegrity, 'partial');
+    assert.equal(request.replayReadiness, 'partial');
+    const requestExtra = request.artifacts.find(
+      artifact => artifact.kind === 'request_headers_extra',
+    )!;
+    const responseExtra = request.artifacts.find(
+      artifact => artifact.kind === 'response_headers_extra',
+    )!;
+    const requestHops = JSON.parse(
+      await fs.readFile(artifactPath(root, requestExtra), 'utf8'),
+    ) as unknown[];
+    const responseHops = JSON.parse(
+      await fs.readFile(artifactPath(root, responseExtra), 'utf8'),
+    ) as unknown[];
+    assert.equal(requestHops.length, 2);
+    assert.equal(responseHops.length, 2);
   } finally {
     await collector.dispose();
     await fs.rm(root, {recursive: true, force: true});

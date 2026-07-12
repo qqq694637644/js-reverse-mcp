@@ -55,20 +55,28 @@ test('tool error logs contain stable metadata but not free-form messages', () =>
   assert.doesNotMatch(output, /EACCES|permission denied|Users\/example/);
 });
 
-test('log files refuse symbolic-link destinations', async () => {
-  const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'mcp-log-link-'));
-  const outside = path.join(directory, 'outside.log');
-  const link = path.join(directory, 'linked.log');
-  await fs.writeFile(outside, 'unchanged', {mode: 0o644});
-  await fs.symlink(outside, link);
-  try {
-    assert.throws(() => saveLogsToFile(link));
-    assert.equal(await fs.readFile(outside, 'utf8'), 'unchanged');
-    assert.equal((await fs.stat(outside)).mode & 0o777, 0o644);
-  } finally {
-    await fs.rm(directory, {recursive: true, force: true});
-  }
-});
+test(
+  'log files refuse symbolic-link destinations',
+  {
+    skip:
+      process.platform === 'win32' &&
+      'POSIX symlink semantics are not supported',
+  },
+  async () => {
+    const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'mcp-log-link-'));
+    const outside = path.join(directory, 'outside.log');
+    const link = path.join(directory, 'linked.log');
+    await fs.writeFile(outside, 'unchanged', {mode: 0o644});
+    await fs.symlink(outside, link);
+    try {
+      assert.throws(() => saveLogsToFile(link));
+      assert.equal(await fs.readFile(outside, 'utf8'), 'unchanged');
+      assert.equal((await fs.stat(outside)).mode & 0o777, 0o644);
+    } finally {
+      await fs.rm(directory, {recursive: true, force: true});
+    }
+  },
+);
 
 test('log files use 0600 and redact free-form credential patterns', async () => {
   const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'mcp-log-'));
@@ -91,7 +99,9 @@ test('log files use 0600 and redact free-form credential patterns', async () => 
 
     const stat = await fs.stat(filename);
     const content = await fs.readFile(filename, 'utf8');
-    assert.equal(stat.mode & 0o777, 0o600);
+    if (process.platform !== 'win32') {
+      assert.equal(stat.mode & 0o777, 0o600);
+    }
     assert.doesNotMatch(
       content,
       /user:pass|query-secret|header-secret|Users\/example\/private/,

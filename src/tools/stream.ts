@@ -60,6 +60,38 @@ const snapshotCompletenessSchema = zod.enum([
   'none',
   'unknown',
 ]);
+const eventPredicateSchema = zod.discriminatedUnion('type', [
+  zod
+    .object({
+      type: zod.literal('exact_data'),
+      value: zod.string().max(64 * 1024),
+    })
+    .strict(),
+  zod
+    .object({
+      type: zod.literal('event_name'),
+      value: zod.string().max(256),
+    })
+    .strict(),
+  zod
+    .object({
+      type: zod.literal('json_path_equals'),
+      path: zod
+        .string()
+        .regex(/^\$\.[A-Za-z0-9_.-]+$/)
+        .max(512),
+      value: zod.unknown(),
+    })
+    .strict(),
+]);
+const eventMatchSchema = zod
+  .object({
+    matched: zod.boolean(),
+    matchedEventIndex: zod.number().int().nonnegative().optional(),
+    matchedRequestId: zod.string().max(512).optional(),
+    matchedSource: zod.enum(['raw-stream', 'eventsource']).optional(),
+  })
+  .strict();
 const artifactSchema = zod
   .object({
     artifactId: zod.string().max(256),
@@ -131,6 +163,7 @@ const failureSchema = zod
       'PENDING_BUFFER_LIMIT',
       'ACTIVATION_ERROR',
       'ARTIFACT_ERROR',
+      'FINALIZE_TIMEOUT',
       'SHUTDOWN_TIMEOUT',
     ]),
   })
@@ -171,6 +204,7 @@ const captureSchema = zod
     integrityStatus: integritySchema,
     collectorIntegrity: integritySchema,
     collectorGeneration: zod.number().int().nonnegative(),
+    captureArmedWallTimeMs: zod.number(),
     captureArmedMonotonicTimeSeconds: zod.number().optional(),
     includeInFlight: zod.boolean(),
     captureScope: zod.literal('page-target-only'),
@@ -239,6 +273,7 @@ const requestSchema = zod
         'pending_limit',
         'activation_error',
         'artifact_error',
+        'finalize_timeout',
         'shutdown_timeout',
       ])
       .optional(),
@@ -250,6 +285,7 @@ const requestSchema = zod
     headersCompleteness: snapshotCompletenessSchema,
     bodyCompleteness: snapshotCompletenessSchema,
     bodyCaptureSource: zod.enum(['cdp-postData-utf8', 'none', 'unavailable']),
+    replayReadiness: zod.enum(['ready', 'partial', 'not-ready']),
     parseStatus: zod.enum(['complete', 'degraded', 'raw-only']),
     parseDegradedReason: zod.string().max(4096).optional(),
     startedMonotonicTimeSeconds: zod.number(),
@@ -296,6 +332,7 @@ const statusDataSchema = zod
     request: requestSchema.optional(),
     recentChunks: zod.array(chunkSchema).max(100).optional(),
     pagination: paginationSchema.optional(),
+    eventMatch: eventMatchSchema.optional(),
   })
   .strict();
 const stopDataSchema = zod
@@ -372,6 +409,7 @@ function captureSummary(capture: StreamCapture) {
     collectorIntegrity: capture.collectorIntegrity,
     collectorGeneration: capture.collectorGeneration,
     captureArmedMonotonicTimeSeconds: capture.captureArmedMonotonicTimeSeconds,
+    captureArmedWallTimeMs: capture.captureArmedWallTimeMs,
     includeInFlight: capture.includeInFlight,
     captureScope: capture.captureScope,
     workerCoverage: capture.workerCoverage,
@@ -451,6 +489,7 @@ function requestSummary(request: StreamRequest) {
     headersCompleteness: request.headersCompleteness,
     bodyCompleteness: request.bodyCompleteness,
     bodyCaptureSource: request.bodyCaptureSource,
+    replayReadiness: request.replayReadiness,
     parseStatus: request.parseStatus,
     parseDegradedReason: request.parseDegradedReason,
     startedMonotonicTimeSeconds: request.startedMonotonicTimeSeconds,
@@ -554,7 +593,7 @@ export const startStreamCapture = defineTool({
 export const getStreamStatus = defineTool({
   name: 'get_stream_status',
   description:
-    'Ordinary MCP primitive that returns bounded status for a global capture ID. It never returns event bodies, credentials, raw bytes, Base64, payload artifacts, or host absolute paths. Full evidence and the complete payload index remain in capture.json and request metadata files.',
+    'Ordinary MCP primitive that returns bounded status for a global capture ID. Optional eventPredicate plus afterEventIndex matches exact_data, event_name, or json_path_equals against the complete on-disk event sequence and returns only match metadata. It never returns event bodies, credentials, raw bytes, Base64, payload artifacts, or host absolute paths.',
   annotations: {
     title: 'Get Stream Capture Status',
     category: ToolCategory.NETWORK,
@@ -567,16 +606,26 @@ export const getStreamStatus = defineTool({
     request: requestSchema.optional(),
     recentChunks: zod.array(chunkSchema).max(100).optional(),
     pagination: paginationSchema.optional(),
+    eventMatch: eventMatchSchema.optional(),
   }),
   schema: {
     captureId: zod.number().int().positive(),
     requestId: zod.string().max(512).optional(),
     includeRecentChunks: zod.boolean().default(false),
+    eventPredicate: eventPredicateSchema.optional(),
+    afterEventIndex: zod.number().int().min(-1).default(-1),
     pageIdx: zod.number().int().min(0).default(0),
     pageSize: zod.number().int().positive().max(100).default(20),
   },
   handler: async (request, response, context) => {
     const capture = context.getStreamCapture(request.params.captureId);
+    const eventMatch = request.params.eventPredicate
+      ? await context.findStreamEventMatch(request.params.captureId, {
+          requestId: request.params.requestId,
+          afterEventIndex: request.params.afterEventIndex,
+          predicate: request.params.eventPredicate,
+        })
+      : undefined;
     if (!request.params.requestId) {
       const paged = paginate(
         capture.requests.map(requestSummary),
@@ -587,6 +636,7 @@ export const getStreamStatus = defineTool({
         capture: captureSummary(capture),
         requests: paged.items,
         pagination: paged.pagination,
+        eventMatch,
       };
       response.appendResponseLine(
         `Stream capture ${capture.id} is ${capture.status}/${capture.integrityStatus} with ${capture.requests.length} request(s).`,
@@ -606,6 +656,7 @@ export const getStreamStatus = defineTool({
     const data: Record<string, unknown> = {
       capture: captureSummary(capture),
       request: requestSummary(streamRequest),
+      eventMatch,
     };
     if (request.params.includeRecentChunks) {
       data.recentChunks = streamRequest.recentChunks;

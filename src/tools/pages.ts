@@ -95,7 +95,7 @@ async function rebuildScriptsAfterNavigationFailure(
 
 export const selectPage = defineTool({
   name: 'select_page',
-  description: `Lists or selects open browser pages. Use it without pageIdx to identify the active page or choose the correct tab before inspecting network traffic, scripts, frames, or console output; pass pageIdx to make one listed page the shared target for later tools. It does not navigate or create pages: use navigate_page to change the selected page's URL and new_page when a separate tab is required. listPageIdx only paginates the page listing and never changes selection.`,
+  description: `Lists or selects open browser pages. Listings return a stable pageId and the current pageIdx. Prefer pageId for later selections because indices can shift when tabs open, close, or reorder; pageIdx remains useful for initial discovery. It does not navigate or create pages: use navigate_page to change the selected page's URL and new_page when a separate tab is required. listPageIdx only paginates the page listing and never changes selection.`,
   annotations: {
     title: 'Select Page',
     category: ToolCategory.NAVIGATION,
@@ -106,6 +106,7 @@ export const selectPage = defineTool({
       .array(
         zod.object({
           pageIdx: zod.number().int(),
+          pageId: zod.string().max(128),
           url: zod.string(),
           selected: zod.boolean(),
         }),
@@ -119,6 +120,13 @@ export const selectPage = defineTool({
       .optional()
       .describe(
         'Snapshot index from the latest page listing. Pass it to make that page the target for later tools; omit it to list pages without changing selection. Re-list after pages open or close because indices can shift.',
+      ),
+    pageId: zod
+      .string()
+      .max(128)
+      .optional()
+      .describe(
+        'Stable page handle returned by a previous listing. Prefer this over pageIdx when tabs may open, close, or reorder.',
       ),
     pageSize: zod
       .number()
@@ -136,7 +144,19 @@ export const selectPage = defineTool({
       ),
   },
   handler: async (request, response, context) => {
-    if (request.params.pageIdx === undefined) {
+    if (
+      request.params.pageIdx !== undefined &&
+      request.params.pageId !== undefined
+    ) {
+      throw new ToolError(
+        'INVALID_ARGUMENT',
+        'Pass either pageId or pageIdx, not both.',
+      );
+    }
+    if (
+      request.params.pageIdx === undefined &&
+      request.params.pageId === undefined
+    ) {
       // List mode
       response.setIncludePages(true, {
         pageSize: request.params.pageSize,
@@ -146,7 +166,9 @@ export const selectPage = defineTool({
     }
 
     // Select mode
-    const page = context.getPageByIdx(request.params.pageIdx);
+    const page = request.params.pageId
+      ? context.getPageByStableId(request.params.pageId)
+      : context.getPageByIdx(request.params.pageIdx!);
     assertBrowserUrlAllowed(page.url());
     await page.bringToFront();
     await context.selectPage(page);
@@ -154,7 +176,10 @@ export const selectPage = defineTool({
       pageSize: request.params.pageSize,
       pageIdx:
         request.params.listPageIdx ??
-        Math.floor(request.params.pageIdx / (request.params.pageSize ?? 20)),
+        Math.floor(
+          (context.getPages().indexOf(page) || 0) /
+            (request.params.pageSize ?? 20),
+        ),
     });
   },
 });

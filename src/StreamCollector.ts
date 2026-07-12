@@ -6,9 +6,10 @@
 
 import {Buffer} from 'node:buffer';
 import {createHash, randomUUID, type Hash} from 'node:crypto';
-import {constants as fsConstants} from 'node:fs';
+import {constants as fsConstants, createReadStream} from 'node:fs';
 import type * as fs from 'node:fs/promises';
 import path from 'node:path';
+import {createInterface} from 'node:readline';
 
 import type {Protocol} from 'devtools-protocol';
 
@@ -71,6 +72,24 @@ export interface StreamCaptureFilter {
 
 export interface StreamCaptureOptions {
   includeInFlight?: boolean;
+}
+
+export type StreamEventPredicate =
+  | {type: 'exact_data'; value: string}
+  | {type: 'event_name'; value: string}
+  | {type: 'json_path_equals'; path: string; value: unknown};
+
+export interface StreamEventMatch {
+  matched: boolean;
+  matchedEventIndex?: number;
+  matchedRequestId?: string;
+  matchedSource?: StreamEventSource;
+}
+
+export interface StreamEventMatchQuery {
+  requestId?: string;
+  afterEventIndex?: number;
+  predicate: StreamEventPredicate;
 }
 
 export interface StreamCaptureLocation {
@@ -206,6 +225,7 @@ export interface StreamRequest {
   headersCompleteness: StreamSnapshotCompleteness;
   bodyCompleteness: StreamSnapshotCompleteness;
   bodyCaptureSource: 'cdp-postData-utf8' | 'none' | 'unavailable';
+  replayReadiness: 'ready' | 'partial' | 'not-ready';
   parseStatus: StreamParseStatus;
   parseDegradedReason?: string;
   startedMonotonicTimeSeconds: number;
@@ -241,6 +261,7 @@ export interface StreamCapture {
   integrityStatus: StreamIntegrityStatus;
   collectorIntegrity: StreamIntegrityStatus;
   collectorGeneration: number;
+  captureArmedWallTimeMs: number;
   captureArmedMonotonicTimeSeconds?: number;
   includeInFlight: boolean;
   captureScope: 'page-target-only';
@@ -302,6 +323,7 @@ export interface StreamCollectorLimits {
   maxPayloadsPerRequest: number;
   maxEventsPerRequest: number;
   maxMetadataBytes: number;
+  extraInfoWaitMs: number;
   shutdownTimeoutMs: number;
 }
 
@@ -317,8 +339,10 @@ interface RequestMetadata {
   postData?: string;
   hasPostData?: boolean;
   initiator?: Protocol.Network.Initiator;
-  requestExtraInfo?: Protocol.Network.RequestWillBeSentExtraInfoEvent;
-  responseExtraInfo?: Protocol.Network.ResponseReceivedExtraInfoEvent;
+  requestExtraInfo: Protocol.Network.RequestWillBeSentExtraInfoEvent[];
+  responseExtraInfo: Protocol.Network.ResponseReceivedExtraInfoEvent[];
+  expectedRequestExtraInfoCount: number;
+  expectedResponseExtraInfoCount: number;
   redirects: Array<{
     url: string;
     status: number;
@@ -391,6 +415,7 @@ interface RequestRuntime {
   finalized: boolean;
   forceTerminated: boolean;
   finalizePromise?: Promise<void>;
+  extraInfoWaiters: Set<() => void>;
   artifacts: Map<StreamArtifactFile['kind'], ArtifactRuntime>;
 }
 
@@ -446,6 +471,7 @@ const DEFAULT_MAX_REQUESTS = 200;
 const DEFAULT_MAX_ARTIFACTS = 2_000;
 const DEFAULT_MAX_PAYLOADS = 500;
 const DEFAULT_MAX_EVENTS = 100_000;
+const DEFAULT_EXTRA_INFO_WAIT_MS = 500;
 const DEFAULT_SHUTDOWN_TIMEOUT_MS = 4_500;
 const BASE_REQUEST_ARTIFACT_COUNT = 16;
 
@@ -958,6 +984,10 @@ export class StreamCollector {
   #listeningForPages = false;
   #disposed = false;
 
+  #touchCapture(capture: StreamCapture): void {
+    capture.version++;
+  }
+
   constructor(
     context: BrowserContext,
     sessionProvider: CdpSessionProvider,
@@ -996,6 +1026,7 @@ export class StreamCollector {
       maxEventsPerRequest: options.maxEventsPerRequest ?? DEFAULT_MAX_EVENTS,
       maxMetadataBytes:
         options.maxMetadataBytes ?? DEFAULT_STREAM_MAX_METADATA_BYTES,
+      extraInfoWaitMs: options.extraInfoWaitMs ?? DEFAULT_EXTRA_INFO_WAIT_MS,
       shutdownTimeoutMs:
         options.shutdownTimeoutMs ?? DEFAULT_SHUTDOWN_TIMEOUT_MS,
     };
@@ -1095,11 +1126,11 @@ export class StreamCollector {
     const ownerMap = this.#requestOwners.get(page)!;
     const requestExtraInfoMap = new Map<
       string,
-      Protocol.Network.RequestWillBeSentExtraInfoEvent
+      Protocol.Network.RequestWillBeSentExtraInfoEvent[]
     >();
     const responseExtraInfoMap = new Map<
       string,
-      Protocol.Network.ResponseReceivedExtraInfoEvent
+      Protocol.Network.ResponseReceivedExtraInfoEvent[]
     >();
 
     const onRequestWillBeSent = (
@@ -1129,8 +1160,19 @@ export class StreamCollector {
         postData: event.request.postData,
         hasPostData: event.request.hasPostData,
         initiator: event.initiator,
-        requestExtraInfo: requestExtraInfoMap.get(event.requestId),
-        responseExtraInfo: responseExtraInfoMap.get(event.requestId),
+        requestExtraInfo:
+          previous?.requestExtraInfo ??
+          requestExtraInfoMap.get(event.requestId) ??
+          [],
+        responseExtraInfo:
+          previous?.responseExtraInfo ??
+          responseExtraInfoMap.get(event.requestId) ??
+          [],
+        expectedRequestExtraInfoCount:
+          (previous?.expectedRequestExtraInfoCount ?? 0) + 1,
+        expectedResponseExtraInfoCount:
+          (previous?.expectedResponseExtraInfoCount ?? 0) +
+          (event.redirectResponse && event.redirectHasExtraInfo ? 1 : 0),
         redirects,
         startedMonotonicTimeSeconds: event.timestamp,
         startedWallTimeMs: Number.isFinite(event.wallTime)
@@ -1145,30 +1187,38 @@ export class StreamCollector {
     const onRequestWillBeSentExtraInfo = (
       event: Protocol.Network.RequestWillBeSentExtraInfoEvent,
     ): void => {
-      requestExtraInfoMap.set(event.requestId, event);
+      const items = requestExtraInfoMap.get(event.requestId) ?? [];
+      items.push(event);
+      requestExtraInfoMap.set(event.requestId, items);
       const metadata = metadataMap.get(event.requestId);
       if (metadata) {
-        metadata.requestExtraInfo = event;
+        metadata.requestExtraInfo = items;
       }
       const request = ownerMap.get(event.requestId);
       const runtime = request ? this.#requestRuntime.get(request) : undefined;
       if (runtime) {
-        runtime.metadata.requestExtraInfo = event;
+        runtime.metadata.requestExtraInfo = items;
+        this.#notifyExtraInfo(runtime);
+        this.#touchCapture(runtime.capture);
       }
     };
 
     const onResponseReceivedExtraInfo = (
       event: Protocol.Network.ResponseReceivedExtraInfoEvent,
     ): void => {
-      responseExtraInfoMap.set(event.requestId, event);
+      const items = responseExtraInfoMap.get(event.requestId) ?? [];
+      items.push(event);
+      responseExtraInfoMap.set(event.requestId, items);
       const metadata = metadataMap.get(event.requestId);
       if (metadata) {
-        metadata.responseExtraInfo = event;
+        metadata.responseExtraInfo = items;
       }
       const request = ownerMap.get(event.requestId);
       const runtime = request ? this.#requestRuntime.get(request) : undefined;
       if (runtime) {
-        runtime.metadata.responseExtraInfo = event;
+        runtime.metadata.responseExtraInfo = items;
+        this.#notifyExtraInfo(runtime);
+        this.#touchCapture(runtime.capture);
       }
     };
 
@@ -1189,11 +1239,19 @@ export class StreamCollector {
         frameId: event.frameId,
         loaderId: event.loaderId,
         headers: {},
+        requestExtraInfo: requestExtraInfoMap.get(event.requestId) ?? [],
+        responseExtraInfo: responseExtraInfoMap.get(event.requestId) ?? [],
+        expectedRequestExtraInfoCount: 0,
+        expectedResponseExtraInfoCount: 0,
         redirects: [],
         startedMonotonicTimeSeconds: event.timestamp,
       };
       metadata.resourceType ??= event.type;
-      metadata.responseExtraInfo ??= responseExtraInfoMap.get(event.requestId);
+      metadata.responseExtraInfo =
+        responseExtraInfoMap.get(event.requestId) ?? metadata.responseExtraInfo;
+      if (event.hasExtraInfo) {
+        metadata.expectedResponseExtraInfoCount++;
+      }
       if (
         !capture.includeInFlight &&
         metadata.collectorGeneration !== capture.collectorGeneration
@@ -1330,9 +1388,12 @@ export class StreamCollector {
       event: Protocol.Network.LoadingFinishedEvent,
     ): void => {
       this.#latestMonotonicTime.set(page, event.timestamp);
-      metadataMap.delete(event.requestId);
-      requestExtraInfoMap.delete(event.requestId);
-      responseExtraInfoMap.delete(event.requestId);
+      this.#scheduleRequestMetadataCleanup(
+        event.requestId,
+        metadataMap,
+        requestExtraInfoMap,
+        responseExtraInfoMap,
+      );
       const request = ownerMap.get(event.requestId);
       const runtime = request ? this.#requestRuntime.get(request) : undefined;
       if (!request || !runtime) {
@@ -1378,9 +1439,12 @@ export class StreamCollector {
         capture.status = 'capturing';
         capture.version++;
       }
-      metadataMap.delete(event.requestId);
-      requestExtraInfoMap.delete(event.requestId);
-      responseExtraInfoMap.delete(event.requestId);
+      this.#scheduleRequestMetadataCleanup(
+        event.requestId,
+        metadataMap,
+        requestExtraInfoMap,
+        responseExtraInfoMap,
+      );
       const runtime = request ? this.#requestRuntime.get(request) : undefined;
       if (!request || !runtime) {
         return;
@@ -1532,7 +1596,7 @@ export class StreamCollector {
       semanticParseIntegrity: 'not-attempted',
       requestSnapshotIntegrity: 'partial',
       artifactIntegrity: 'complete',
-      headersCompleteness: metadata.requestExtraInfo ? 'complete' : 'partial',
+      headersCompleteness: 'partial',
       bodyCompleteness: metadata.hasPostData
         ? metadata.postData
           ? 'partial'
@@ -1543,6 +1607,7 @@ export class StreamCollector {
           ? 'cdp-postData-utf8'
           : 'unavailable'
         : 'none',
+      replayReadiness: 'partial',
       parseStatus: 'complete',
       startedMonotonicTimeSeconds: metadata.startedMonotonicTimeSeconds,
       startedWallTimeMs: metadata.startedWallTimeMs,
@@ -1598,6 +1663,7 @@ export class StreamCollector {
       pendingBytes: 0,
       finalized: false,
       forceTerminated: false,
+      extraInfoWaiters: new Set(),
       artifacts,
     };
     const initializationPromise = this.#initializeRequestFiles(
@@ -1808,25 +1874,32 @@ export class StreamCollector {
       request.bodyCaptureSource = 'cdp-postData-utf8';
     }
     const requestHeaders = runtime.metadata.headers;
-    const requestExtraHeaders = runtime.metadata.requestExtraInfo?.headers;
+    const requestExtraInfos = runtime.metadata.requestExtraInfo;
+    const responseExtraInfos = runtime.metadata.responseExtraInfo;
+    const requestExtraHeaders = requestExtraInfos.map(item => item.headers);
     const responseHeaders = responseEvent?.response.headers ?? {};
-    const responseExtraHeaders = runtime.metadata.responseExtraInfo?.headers;
-    request.headersCompleteness =
-      requestExtraHeaders && (responseEvent ? responseExtraHeaders : true)
-        ? 'complete'
-        : 'partial';
+    const responseExtraHeaders = responseExtraInfos.map(item => item.headers);
+    request.headersCompleteness = this.#hasExpectedExtraInfo(runtime.metadata)
+      ? 'complete'
+      : 'partial';
     request.requestSnapshotIntegrity =
       request.headersCompleteness === 'complete' &&
-      request.bodyCompleteness !== 'unknown'
+      (request.bodyCompleteness === 'complete' ||
+        request.bodyCompleteness === 'none')
         ? 'complete'
         : 'partial';
+    request.replayReadiness =
+      request.requestSnapshotIntegrity === 'complete'
+        ? 'ready'
+        : request.headersCompleteness === 'complete' &&
+            request.bodyCompleteness === 'partial'
+          ? 'partial'
+          : 'not-ready';
     const credentialArtifact = runtime.artifacts.get('request_headers');
     if (credentialArtifact) {
       credentialArtifact.descriptor.containsCredentials =
         containsCredentialHeaders(requestHeaders) ||
-        Boolean(
-          requestExtraHeaders && containsCredentialHeaders(requestExtraHeaders),
-        );
+        requestExtraHeaders.some(headers => containsCredentialHeaders(headers));
       credentialArtifact.descriptor.sensitivity = credentialArtifact.descriptor
         .containsCredentials
         ? 'credential'
@@ -1846,10 +1919,7 @@ export class StreamCollector {
         request,
         runtime,
         'request_headers_extra',
-        Buffer.from(
-          `${JSON.stringify(runtime.metadata.requestExtraInfo ?? null, null, 2)}\n`,
-          'utf8',
-        ),
+        Buffer.from(`${JSON.stringify(requestExtraInfos, null, 2)}\n`, 'utf8'),
       ),
       this.#writeArtifactOnce(
         request,
@@ -1859,12 +1929,13 @@ export class StreamCollector {
           `${JSON.stringify(
             {
               headers: redactHeaders(requestHeaders),
-              extraHeaders: requestExtraHeaders
-                ? redactHeaders(requestExtraHeaders)
-                : undefined,
-              associatedCookieCount:
-                runtime.metadata.requestExtraInfo?.associatedCookies.length ??
+              extraHeaders: requestExtraHeaders.map(headers =>
+                redactHeaders(headers),
+              ),
+              associatedCookieCount: requestExtraInfos.reduce(
+                (count, item) => count + item.associatedCookies.length,
                 0,
+              ),
             },
             null,
             2,
@@ -1920,10 +1991,7 @@ export class StreamCollector {
         request,
         runtime,
         'response_headers_extra',
-        Buffer.from(
-          `${JSON.stringify(runtime.metadata.responseExtraInfo ?? null, null, 2)}\n`,
-          'utf8',
-        ),
+        Buffer.from(`${JSON.stringify(responseExtraInfos, null, 2)}\n`, 'utf8'),
       ),
       this.#writeArtifactOnce(
         request,
@@ -1936,9 +2004,9 @@ export class StreamCollector {
               status: responseEvent?.response.status,
               statusText: responseEvent?.response.statusText,
               headers: redactHeaders(responseHeaders),
-              extraHeaders: responseExtraHeaders
-                ? redactHeaders(responseExtraHeaders)
-                : undefined,
+              extraHeaders: responseExtraHeaders.map(headers =>
+                redactHeaders(headers),
+              ),
             },
             null,
             2,
@@ -2275,6 +2343,7 @@ export class StreamCollector {
         droppedChunkCount: 0,
         droppedBytes: 0,
       };
+      this.#touchCapture(runtime.capture);
       return;
     }
     if (destination === 'raw') {
@@ -2366,6 +2435,7 @@ export class StreamCollector {
           this.#trimRecent(request.recentSemanticEvents);
         }
         request.defaultDoneMarkerObserved ||= event.defaultDoneMarker;
+        this.#touchCapture(runtime.capture);
       } catch (error) {
         this.#markArtifactFailure(request, runtime, target, error);
       }
@@ -2389,6 +2459,7 @@ export class StreamCollector {
       source: event.source,
       invalidUtf8: event.invalidUtf8,
       dataLength: event.data.length,
+      dataSha256: createHash('sha256').update(event.data, 'utf8').digest('hex'),
       rawByteStart: event.rawByteStart,
       rawByteEnd: event.rawByteEnd,
       decodedCharStart: event.decodedCharStart,
@@ -2478,6 +2549,9 @@ export class StreamCollector {
         return {
           $payloadOmitted: true,
           encodedChars: value.length,
+          encodedSha256: createHash('sha256')
+            .update(value, 'utf8')
+            .digest('hex'),
           decodedBytes: candidate.bytes.length,
           sha256: createHash('sha256').update(candidate.bytes).digest('hex'),
           reason: 'payload_limit',
@@ -2498,6 +2572,9 @@ export class StreamCollector {
         return {
           $payloadOmitted: true,
           encodedChars: value.length,
+          encodedSha256: createHash('sha256')
+            .update(value, 'utf8')
+            .digest('hex'),
           decodedBytes: candidate.bytes.length,
           sha256: createHash('sha256').update(candidate.bytes).digest('hex'),
           reason: 'artifact_limit',
@@ -2538,6 +2615,7 @@ export class StreamCollector {
         $artifact: artifact,
         encoding: 'base64',
         encodedChars: value.length,
+        encodedSha256: createHash('sha256').update(value, 'utf8').digest('hex'),
         decodedBytes: candidate.bytes.length,
         detectionConfidence: candidate.confidence,
         jsonPointerSha256: pointerHash,
@@ -2580,7 +2658,66 @@ export class StreamCollector {
       return;
     }
     runtime.terminal ??= terminal;
+    this.#touchCapture(runtime.capture);
     void this.#finalizeRequest(request);
+  }
+
+  #notifyExtraInfo(runtime: RequestRuntime): void {
+    for (const resolve of runtime.extraInfoWaiters) {
+      resolve();
+    }
+    runtime.extraInfoWaiters.clear();
+  }
+
+  #hasExpectedExtraInfo(metadata: RequestMetadata): boolean {
+    return (
+      metadata.requestExtraInfo.length >=
+        metadata.expectedRequestExtraInfoCount &&
+      metadata.responseExtraInfo.length >=
+        metadata.expectedResponseExtraInfoCount
+    );
+  }
+
+  async #waitForExtraInfo(runtime: RequestRuntime): Promise<boolean> {
+    if (this.#hasExpectedExtraInfo(runtime.metadata)) {
+      return true;
+    }
+    const deadline = Date.now() + this.#limits.extraInfoWaitMs;
+    while (
+      !runtime.forceTerminated &&
+      !this.#hasExpectedExtraInfo(runtime.metadata) &&
+      Date.now() < deadline
+    ) {
+      await Promise.race([
+        new Promise<void>(resolve => runtime.extraInfoWaiters.add(resolve)),
+        new Promise<void>(resolve =>
+          setTimeout(resolve, Math.min(50, Math.max(1, deadline - Date.now()))),
+        ),
+      ]);
+    }
+    return this.#hasExpectedExtraInfo(runtime.metadata);
+  }
+
+  #scheduleRequestMetadataCleanup(
+    requestId: string,
+    metadataMap: Map<string, RequestMetadata>,
+    requestExtraInfoMap: Map<
+      string,
+      Protocol.Network.RequestWillBeSentExtraInfoEvent[]
+    >,
+    responseExtraInfoMap: Map<
+      string,
+      Protocol.Network.ResponseReceivedExtraInfoEvent[]
+    >,
+  ): void {
+    setTimeout(
+      () => {
+        metadataMap.delete(requestId);
+        requestExtraInfoMap.delete(requestId);
+        responseExtraInfoMap.delete(requestId);
+      },
+      Math.max(2_000, this.#limits.extraInfoWaitMs * 2),
+    );
   }
 
   async #finalizeRequest(request: StreamRequest): Promise<void> {
@@ -2597,6 +2734,25 @@ export class StreamCollector {
         await runtime.activationPromise;
         if (runtime.forceTerminated) {
           return;
+        }
+        const skipExtraInfoWait =
+          !request.responseObserved ||
+          [
+            'collector_stop',
+            'shutdown_timeout',
+            'page_close',
+            'finalize_timeout',
+          ].includes(runtime.terminal?.reason ?? '');
+        const extraInfoComplete = skipExtraInfoWait
+          ? this.#hasExpectedExtraInfo(runtime.metadata)
+          : await this.#waitForExtraInfo(runtime);
+        if (!extraInfoComplete) {
+          request.headersCompleteness = 'partial';
+          request.requestSnapshotIntegrity = 'partial';
+          request.replayReadiness = 'partial';
+          request.writeErrors.push(
+            'Timed out waiting for all expected Network ExtraInfo events.',
+          );
         }
         if (!runtime.snapshotStarted) {
           runtime.snapshotStarted = true;
@@ -2677,6 +2833,7 @@ export class StreamCollector {
       this.#recomputeRequestIntegrity(request, runtime);
       await this.#writeRequestMetadata(request, runtime);
       this.#recomputeCaptureIntegrity(runtime.capture);
+      this.#touchCapture(runtime.capture);
       await this.#queueCaptureMetadata(runtime.capture);
     })();
     await runtime.finalizePromise;
@@ -2914,6 +3071,7 @@ export class StreamCollector {
       headersCompleteness: request.headersCompleteness,
       bodyCompleteness: request.bodyCompleteness,
       bodyCaptureSource: request.bodyCaptureSource,
+      replayReadiness: request.replayReadiness,
       parseStatus: request.parseStatus,
       parseDegradedReason: request.parseDegradedReason,
       startedMonotonicTimeSeconds: request.startedMonotonicTimeSeconds,
@@ -2946,6 +3104,7 @@ export class StreamCollector {
       integrityStatus: capture.integrityStatus,
       collectorIntegrity: capture.collectorIntegrity,
       collectorGeneration: capture.collectorGeneration,
+      captureArmedWallTimeMs: capture.captureArmedWallTimeMs,
       captureArmedMonotonicTimeSeconds:
         capture.captureArmedMonotonicTimeSeconds,
       includeInFlight: capture.includeInFlight,
@@ -3183,6 +3342,7 @@ export class StreamCollector {
     } else {
       request.integrityStatus = 'partial';
     }
+    this.#touchCapture(runtime.capture);
   }
 
   #failCaptureLimit(
@@ -3201,6 +3361,7 @@ export class StreamCollector {
       droppedBytes: 0,
     };
     capture.errors.push(bounded(message) ?? 'Capture limit exceeded.');
+    this.#touchCapture(capture);
     const runtime = this.#captureRuntime.get(capture);
     if (runtime && this.#activeCaptureByPage.get(runtime.page) === capture) {
       this.#activeCaptureByPage.delete(runtime.page);
@@ -3258,6 +3419,7 @@ export class StreamCollector {
       integrityStatus: 'partial',
       collectorIntegrity: 'partial',
       collectorGeneration,
+      captureArmedWallTimeMs: Date.now(),
       captureArmedMonotonicTimeSeconds: this.#latestMonotonicTime.get(page),
       includeInFlight: options.includeInFlight ?? false,
       captureScope: 'page-target-only',
@@ -3300,6 +3462,170 @@ export class StreamCollector {
     return capture;
   }
 
+  async findEventMatch(
+    captureId: number,
+    query: StreamEventMatchQuery,
+  ): Promise<StreamEventMatch> {
+    const capture = this.getById(captureId);
+    const afterEventIndex = query.afterEventIndex ?? -1;
+    const requests = query.requestId
+      ? capture.requests.filter(
+          request =>
+            request.cdpRequestId === query.requestId ||
+            request.persistentRequestId === query.requestId,
+        )
+      : capture.requests;
+    for (const request of requests) {
+      const runtime = this.#requestRuntime.get(request);
+      if (!runtime) {
+        continue;
+      }
+      await runtime.writeChain.catch(() => undefined);
+      for (const [kind, source] of [
+        ['events', 'raw-stream'],
+        ['eventsource_events', 'eventsource'],
+      ] as const) {
+        const artifact = runtime.artifacts.get(kind);
+        if (!artifact || artifact.descriptor.writeStatus === 'failed') {
+          continue;
+        }
+        const filePath = path.join(
+          runtime.absoluteDir,
+          artifact.relativeToRequestDir,
+        );
+        const stream = createReadStream(filePath, {encoding: 'utf8'});
+        const lines = createInterface({input: stream, crlfDelay: Infinity});
+        try {
+          for await (const line of lines) {
+            let record: Record<string, unknown>;
+            try {
+              const parsed = JSON.parse(line) as unknown;
+              if (
+                !parsed ||
+                typeof parsed !== 'object' ||
+                Array.isArray(parsed)
+              ) {
+                continue;
+              }
+              record = parsed as Record<string, unknown>;
+            } catch {
+              continue;
+            }
+            const index = record.index;
+            if (
+              typeof index !== 'number' ||
+              !Number.isInteger(index) ||
+              index <= afterEventIndex
+            ) {
+              continue;
+            }
+            if (!this.#matchesEventPredicate(record, query.predicate)) {
+              continue;
+            }
+            return {
+              matched: true,
+              matchedEventIndex: index,
+              matchedRequestId: request.cdpRequestId,
+              matchedSource: source,
+            };
+          }
+        } finally {
+          lines.close();
+          stream.destroy();
+        }
+      }
+    }
+    return {matched: false};
+  }
+
+  #matchesEventPredicate(
+    record: Record<string, unknown>,
+    predicate: StreamEventPredicate,
+  ): boolean {
+    if (predicate.type === 'exact_data') {
+      return (
+        record.dataLength === predicate.value.length &&
+        record.dataSha256 ===
+          createHash('sha256').update(predicate.value, 'utf8').digest('hex')
+      );
+    }
+    if (predicate.type === 'event_name') {
+      return record.eventName === predicate.value;
+    }
+    const value = this.#readJsonPath(record.dataJson, predicate.path);
+    return this.#materializedValueEquals(value, predicate.value);
+  }
+
+  #materializedValueEquals(actual: unknown, expected: unknown): boolean {
+    if (
+      actual &&
+      typeof actual === 'object' &&
+      !Array.isArray(actual) &&
+      typeof expected === 'string'
+    ) {
+      const descriptor = actual as Record<string, unknown>;
+      if (descriptor.$largeText === true) {
+        return (
+          descriptor.chars === expected.length &&
+          descriptor.sha256 ===
+            createHash('sha256').update(expected, 'utf8').digest('hex')
+        );
+      }
+      if (
+        descriptor.encoding === 'base64' &&
+        typeof descriptor.encodedChars === 'number' &&
+        typeof descriptor.encodedSha256 === 'string'
+      ) {
+        return (
+          descriptor.encodedChars === expected.length &&
+          descriptor.encodedSha256 ===
+            createHash('sha256').update(expected, 'utf8').digest('hex')
+        );
+      }
+    }
+    if (Array.isArray(actual) && Array.isArray(expected)) {
+      return (
+        actual.length === expected.length &&
+        actual.every((item, index) =>
+          this.#materializedValueEquals(item, expected[index]),
+        )
+      );
+    }
+    if (
+      actual &&
+      expected &&
+      typeof actual === 'object' &&
+      typeof expected === 'object' &&
+      !Array.isArray(actual) &&
+      !Array.isArray(expected)
+    ) {
+      const actualObject = actual as Record<string, unknown>;
+      const expectedObject = expected as Record<string, unknown>;
+      const expectedKeys = Object.keys(expectedObject);
+      return (
+        Object.keys(actualObject).length === expectedKeys.length &&
+        expectedKeys.every(key =>
+          this.#materializedValueEquals(actualObject[key], expectedObject[key]),
+        )
+      );
+    }
+    return Object.is(actual, expected);
+  }
+
+  #readJsonPath(value: unknown, jsonPath: string): unknown {
+    if (!jsonPath.startsWith('$.')) {
+      return undefined;
+    }
+    let current = value;
+    for (const segment of jsonPath.slice(2).split('.')) {
+      if (!current || typeof current !== 'object' || Array.isArray(current)) {
+        return undefined;
+      }
+      current = (current as Record<string, unknown>)[segment];
+    }
+    return current;
+  }
+
   async stopCapture(
     captureId: number,
     options: {
@@ -3318,6 +3644,7 @@ export class StreamCollector {
     if (capture.status !== 'failed') {
       capture.status = 'stopped';
     }
+    this.#touchCapture(capture);
     if (this.#activeCaptureByPage.get(runtime.page) === capture) {
       this.#activeCaptureByPage.delete(runtime.page);
     }
@@ -3356,6 +3683,7 @@ export class StreamCollector {
       await this.#forceFinalizeCapture(capture, getErrorText(error));
     }
     this.#recomputeCaptureIntegrity(capture);
+    this.#touchCapture(capture);
     await this.#queueCaptureMetadata(capture);
     return capture;
   }
@@ -3422,6 +3750,7 @@ export class StreamCollector {
       bounded(`Stream finalization interrupted: ${errorText}`) ??
         'Stream finalization interrupted.',
     );
+    this.#touchCapture(capture);
     for (const request of capture.requests) {
       const runtime = this.#requestRuntime.get(request);
       if (!runtime || runtime.finalized) {
@@ -3446,6 +3775,7 @@ export class StreamCollector {
       await this.#closeRequestHandles(runtime);
       runtime.finalized = true;
       await this.#writeRequestMetadata(request, runtime).catch(() => undefined);
+      this.#touchCapture(capture);
     }
   }
 
@@ -3459,6 +3789,7 @@ export class StreamCollector {
       capture.status = 'failed';
       capture.stoppedWallTimeMs ??= Date.now();
       capture.errors.push('Owning page closed before capture was finalized.');
+      this.#touchCapture(capture);
       for (const request of capture.requests) {
         const runtime = this.#requestRuntime.get(request);
         if (!runtime) {
@@ -3528,6 +3859,7 @@ export class StreamCollector {
             `Stream shutdown finalization timed out after ${timeoutMs}ms: ${options.reason ?? 'shutdown'}`,
           ) ?? 'Stream shutdown finalization timed out.',
         );
+        this.#touchCapture(capture);
         for (const request of capture.requests) {
           const runtime = this.#requestRuntime.get(request);
           runtime?.activationAbort.abort(new Error('shutdown timeout'));

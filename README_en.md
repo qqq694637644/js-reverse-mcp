@@ -226,7 +226,7 @@ List WebSocket connections, analyze message patterns, view messages of specific 
 Stream capture is not retroactive. MCP always registers the three lifecycle tools. `web_rev_action` should keep this MCP private, call it through an adapter allowlist, and expose only atomic `runBrowserExperiment(capture_flow)` to GPT. See [docs/stream-capture-capability.md](docs/stream-capture-capability.md).
 
 ```text
-1. Configure `--allowedRoots` for the shared Gateway workspace and select one root explicitly with `--streamArtifactRoot`
+1. Configure `--allowedRoots` for the Action backend's LocalEvidenceStore and select one root explicitly with `--streamArtifactRoot`
 2. The backend calls start_stream_capture and may pass a constrained experiment namespace so evidence lands under `experiments/<namespace>/js-reverse/`
 3. The backend triggers the fetch/XHR/EventSource request inside the same experiment
 4. get_stream_status returns only status, counts, relative paths, and bounded recent chunk offsets
@@ -273,9 +273,11 @@ The CLI stays intentionally small and every flag is optional. Default behavior i
 | `--streamPendingMaxBytes`     | Maximum pending bytes retained in memory before activation completes. Exceeding it fails explicitly.                                                                                                                                                                                                  | `8388608`   |
 | `--streamMaxSseEventBytes`    | Semantic parser limit for one SSE event or incomplete tail. Raw evidence continues when parsing degrades.                                                                                                                                                                                             | `8388608`   |
 
-Streaming capture requires both `--allowedRoots` and `--streamArtifactRoot`. In a web integration, `js-reverse-mcp` and the Gateway workspace must see the same filesystem directory, or equivalent container volume mappings. MCP returns only an allowed-root index, workspace-relative paths, and opaque artifact IDs—not host absolute paths.
+Streaming capture requires both `--allowedRoots` and `--streamArtifactRoot`. With `web_rev_action`, both local processes must see the same LocalEvidenceStore directory; this is not a GitHub Gateway workspace. MCP returns only an allowed-root index, evidence-root-relative paths, and opaque artifact IDs—not host absolute paths.
 
-Request snapshots keep ordinary headers, CDP ExtraInfo, UTF-8 `postData`, and explicit completeness metadata separately. They are not wire-level body bytes. Credential artifacts are marked `credential` and have separate redacted header artifacts for default reading.
+Request snapshots keep ordinary headers, redirect-hop CDP ExtraInfo, UTF-8 `postData`, and explicit completeness metadata separately. They are not wire-level body bytes. `requestSnapshotIntegrity` uses the weakest headers/body dimension and `replayReadiness` is reported separately. Credential artifacts are marked `credential` and have separate redacted header artifacts for default reading.
+
+`get_stream_status` accepts a controlled `eventPredicate` plus `afterEventIndex`. The collector matches `exact_data`, `event_name`, or `json_path_equals` against the full event artifacts and returns only match metadata, never the event body. Page listings also return a stable `pageId` that can be selected after tab indices shift.
 
 ### Example Configurations
 

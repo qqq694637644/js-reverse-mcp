@@ -284,6 +284,7 @@ test('select_page waits for debugger reinitialization before returning', async (
       {setIncludePages: () => undefined} as never,
       {
         getPageByIdx: () => page,
+        getPages: () => [page],
         selectPage: () => selected.promise,
       } as never,
     )
@@ -296,4 +297,38 @@ test('select_page waits for debugger reinitialization before returning', async (
   selected.resolve();
   await call;
   assert.equal(settled, true);
+});
+
+test('select_page accepts a stable pageId when indices may shift', async () => {
+  const page = {
+    bringToFront: async () => undefined,
+    url: () => 'https://example.test/stable',
+  };
+  let selected: unknown;
+  await selectPage.handler(
+    {params: {pageId: 'page_stable', pageIdx: undefined}},
+    {setIncludePages: () => undefined} as never,
+    {
+      getPageByStableId: (pageId: string) => {
+        assert.equal(pageId, 'page_stable');
+        return page;
+      },
+      getPages: () => [page],
+      selectPage: async (value: unknown) => {
+        selected = value;
+      },
+    } as never,
+  );
+  assert.equal(selected, page);
+});
+
+test('select_page rejects passing pageId and pageIdx together', async () => {
+  await assert.rejects(
+    selectPage.handler(
+      {params: {pageId: 'page_stable', pageIdx: 0}},
+      {setIncludePages: () => undefined} as never,
+      {} as never,
+    ),
+    /either pageId or pageIdx/i,
+  );
 });

@@ -4,6 +4,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+import {randomUUID} from 'node:crypto';
 import {constants as fsConstants} from 'node:fs';
 import fs from 'node:fs/promises';
 import os from 'node:os';
@@ -22,6 +23,8 @@ import type {ListenerMap, RequestInitiator} from './PageCollector.js';
 import type {
   StreamCapture,
   StreamCaptureFilter,
+  StreamEventMatch,
+  StreamEventMatchQuery,
   StreamCaptureOptions,
 } from './StreamCollector.js';
 import {StreamCollector} from './StreamCollector.js';
@@ -69,6 +72,8 @@ export class McpContext implements Context {
 
   // The most recent page state.
   #pages: Page[] = [];
+  #pageIds = new WeakMap<Page, string>();
+  #pagesById = new Map<string, Page>();
   #pageToDevToolsPage = new Map<Page, Page>();
   #selectedPage?: Page;
   #networkCollector: NetworkCollector;
@@ -440,6 +445,13 @@ export class McpContext implements Context {
     return this.#streamCollector.getById(captureId);
   }
 
+  async findStreamEventMatch(
+    captureId: number,
+    query: StreamEventMatchQuery,
+  ): Promise<StreamEventMatch> {
+    return this.#streamCollector.findEventMatch(captureId, query);
+  }
+
   async stopStreamCapture(
     captureId: number,
     options: {signal?: AbortSignal; deadlineWallTimeMs?: number} = {},
@@ -473,6 +485,27 @@ export class McpContext implements Context {
     const page = pages[idx];
     if (!page) {
       throw new Error('No page found');
+    }
+    return page;
+  }
+
+  getPageStableId(page: Page): string {
+    let pageId = this.#pageIds.get(page);
+    if (!pageId) {
+      pageId = `page_${randomUUID()}`;
+      this.#pageIds.set(page, pageId);
+      this.#pagesById.set(pageId, page);
+    }
+    return pageId;
+  }
+
+  getPageByStableId(pageId: string): Page {
+    const page = this.#pagesById.get(pageId);
+    if (!page || page.isClosed() || !this.#pages.includes(page)) {
+      throw new ToolError(
+        'NOT_FOUND',
+        `Page ${pageId} is no longer available. List pages again.`,
+      );
     }
     return page;
   }
@@ -550,6 +583,15 @@ export class McpContext implements Context {
     this.#pages = allPages.filter(
       page => !page.url().startsWith('devtools://'),
     );
+    const currentPages = new Set(this.#pages);
+    for (const [pageId, page] of this.#pagesById) {
+      if (!currentPages.has(page) || page.isClosed()) {
+        this.#pagesById.delete(pageId);
+      }
+    }
+    for (const page of this.#pages) {
+      this.getPageStableId(page);
+    }
 
     if (!this.#selectedPage || this.#pages.indexOf(this.#selectedPage) === -1) {
       await this.selectPage(this.#pages[0]);

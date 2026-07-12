@@ -10,6 +10,8 @@ import type {RequestInitiator} from '../PageCollector.js';
 import type {
   StreamCapture,
   StreamCaptureFilter,
+  StreamEventMatch,
+  StreamEventMatchQuery,
   StreamCaptureOptions,
 } from '../StreamCollector.js';
 import {zod} from '../third_party/index.js';
@@ -152,6 +154,8 @@ export type Context = Readonly<{
   clearDialog(): void;
   getPages(): Page[];
   getPageByIdx(idx: number): Page;
+  getPageStableId(page: Page): string;
+  getPageByStableId(pageId: string): Page;
   isPageSelected(page: Page): boolean;
   newPage(): Promise<Page>;
   closePage(pageIdx: number): Promise<void>;
@@ -204,6 +208,10 @@ export type Context = Readonly<{
     options?: StreamCaptureOptions & {artifactNamespace?: string},
   ): Promise<StreamCapture>;
   getStreamCapture(captureId: number): StreamCapture;
+  findStreamEventMatch(
+    captureId: number,
+    query: StreamEventMatchQuery,
+  ): Promise<StreamEventMatch>;
   stopStreamCapture(
     captureId: number,
     options?: {signal?: AbortSignal; deadlineWallTimeMs?: number},

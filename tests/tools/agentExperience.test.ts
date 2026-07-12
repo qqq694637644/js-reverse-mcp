@@ -269,7 +269,9 @@ test('file output cannot overwrite an existing file without confirmation', async
       {confirmOverwrite: true},
     );
     assert.equal(await fs.readFile(filename, 'utf8'), 'replacement');
-    assert.equal((await fs.stat(filename)).mode & 0o777, 0o600);
+    if (process.platform !== 'win32') {
+      assert.equal((await fs.stat(filename)).mode & 0o777, 0o600);
+    }
   } finally {
     await fs.rm(directory, {recursive: true, force: true});
   }

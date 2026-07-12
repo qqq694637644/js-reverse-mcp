@@ -52,8 +52,84 @@ test('stream tools expose only start, status, and stop responsibilities', () => 
 test('status schema defaults to bounded summaries', () => {
   const parsed = zod.object(getStreamStatus.schema).parse({captureId: 1});
   assert.equal(parsed.includeRecentChunks, false);
+  assert.equal(parsed.afterEventIndex, -1);
   assert.equal(parsed.pageIdx, 0);
   assert.equal(parsed.pageSize, 20);
+});
+
+test('status accepts a controlled event predicate without event body output', async () => {
+  const capture = {
+    id: 1,
+    uuid: '11111111-1111-4111-8111-111111111111',
+    status: 'capturing',
+    integrityStatus: 'partial',
+    collectorIntegrity: 'partial',
+    collectorGeneration: 1,
+    captureArmedWallTimeMs: 1,
+    includeInFlight: false,
+    captureScope: 'page-target-only',
+    workerCoverage: false,
+    filter: {mimeTypes: ['text/event-stream']},
+    artifactRootIndex: 0,
+    relativeDir: 'captures/one',
+    metadataArtifact: {
+      artifactId: 'capture-meta',
+      kind: 'capture_metadata',
+      rootIndex: 0,
+      relativePath: 'captures/one/capture.json',
+      bytes: 1,
+      writeStatus: 'written',
+    },
+    pageUrl: 'https://example.test',
+    createdWallTimeMs: 1,
+    requests: [],
+    totalRawBytes: 0,
+    diskBytesReserved: 0,
+    chunkCount: 0,
+    rawEventCount: 51,
+    semanticEventCount: 0,
+    quotaBytes: 1000,
+    errors: [],
+    version: 52,
+  } as unknown as StreamCapture;
+  let structured: Record<string, unknown> | undefined;
+  await getStreamStatus.handler(
+    {
+      params: {
+        captureId: 1,
+        requestId: undefined,
+        includeRecentChunks: false,
+        eventPredicate: {type: 'exact_data', value: 'target'},
+        afterEventIndex: 0,
+        pageIdx: 0,
+        pageSize: 20,
+      },
+    },
+    {
+      appendResponseLine: () => undefined,
+      setStructuredContent: (value: Record<string, unknown>) => {
+        structured = value;
+      },
+    } as never,
+    {
+      getStreamCapture: () => capture,
+      findStreamEventMatch: async () => ({
+        matched: true,
+        matchedEventIndex: 1,
+        matchedRequestId: 'request-1',
+        matchedSource: 'raw-stream',
+      }),
+    } as never,
+  );
+  assert.deepEqual(structured?.eventMatch, {
+    matched: true,
+    matchedEventIndex: 1,
+    matchedRequestId: 'request-1',
+    matchedSource: 'raw-stream',
+  });
+  const serialized = JSON.stringify(structured);
+  assert.equal(serialized.includes('event body'), false);
+  assert.equal(serialized.includes('"data":"target"'), false);
 });
 
 test('recursive stream output guard rejects body and Base64 fields', () => {
@@ -136,6 +212,7 @@ test('stop runtime validation returns only capture and request metadata artifact
     integrityStatus: 'complete',
     collectorIntegrity: 'complete',
     collectorGeneration: 1,
+    captureArmedWallTimeMs: 1,
     includeInFlight: false,
     captureScope: 'page-target-only',
     workerCoverage: false,

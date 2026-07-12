@@ -86,11 +86,12 @@ content is kept for human-readable compatibility.
 
 ### `select_page`
 
-**Description:** Lists or selects open browser pages. Use it without pageIdx to identify the active page or choose the correct tab before inspecting network traffic, scripts, frames, or console output; pass pageIdx to make one listed page the shared target for later tools. It does not navigate or create pages: use [`navigate_page`](#navigate_page) to change the selected page's URL and [`new_page`](#new_page) when a separate tab is required. listPageIdx only paginates the page listing and never changes selection.
+**Description:** Lists or selects open browser pages. Listings return a stable pageId and the current pageIdx. Prefer pageId for later selections because indices can shift when tabs open, close, or reorder; pageIdx remains useful for initial discovery. It does not navigate or create pages: use [`navigate_page`](#navigate_page) to change the selected page's URL and [`new_page`](#new_page) when a separate tab is required. listPageIdx only paginates the page listing and never changes selection.
 
 **Parameters:**
 
 - **listPageIdx** (integer) _(optional)_: Zero-based pagination index for the page listing only. This is not the pageIdx used to select a browser page. Defaults to 0.
+- **pageId** (string) _(optional)_: Stable page handle returned by a previous listing. Prefer this over pageIdx when tabs may open, close, or reorder.
 - **pageIdx** (number) _(optional)_: Snapshot index from the latest page listing. Pass it to make that page the target for later tools; omit it to list pages without changing selection. Re-list after pages open or close because indices can shift.
 - **pageSize** (integer) _(optional)_: Maximum pages to list per response. Defaults to 20.
 
@@ -123,11 +124,13 @@ content is kept for human-readable compatibility.
 
 ### `get_stream_status`
 
-**Description:** Ordinary MCP primitive that returns bounded status for a global capture ID. It never returns event bodies, credentials, raw bytes, Base64, payload artifacts, or host absolute paths. Full evidence and the complete payload index remain in capture.json and request metadata files.
+**Description:** Ordinary MCP primitive that returns bounded status for a global capture ID. Optional eventPredicate plus afterEventIndex matches exact_data, event_name, or json_path_equals against the complete on-disk event sequence and returns only match metadata. It never returns event bodies, credentials, raw bytes, Base64, payload artifacts, or host absolute paths.
 
 **Parameters:**
 
+- **afterEventIndex** (integer) _(optional)_
 - **captureId** (integer) **(required)**
+- **eventPredicate** (unknown) _(optional)_
 - **includeRecentChunks** (boolean) _(optional)_
 - **pageIdx** (integer) _(optional)_
 - **pageSize** (integer) _(optional)_

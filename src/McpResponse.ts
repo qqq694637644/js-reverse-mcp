@@ -378,6 +378,7 @@ export class McpResponse implements Response {
       this.setStructuredContent({
         pages: pageData.items.map((page, offset) => ({
           pageIdx: pageData.startIndex + offset,
+          pageId: context.getPageStableId(page),
           url: formatBrowserUrlForOutput(page.url()),
           selected: context.isPageSelected(page),
         })),

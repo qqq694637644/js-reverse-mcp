@@ -47,7 +47,7 @@ experiments/<artifactNamespace>/js-reverse/capture-<uuid>/
 
 This is not an arbitrary output path. Every namespace segment is validated and resolved below the configured root. Deployments without an experiment namespace use `js-reverse-streams/capture-<uuid>/`.
 
-One workspace per MCP process is the simplest deployment. A shared MCP process must use a distinct namespace per experiment/session and keep the selected artifact root mounted into the same Gateway workspace.
+One LocalEvidenceStore root per MCP process is the simplest deployment. A shared MCP process must use a distinct namespace per experiment/session and keep the selected artifact root visible to the same Action backend. No GitHub Gateway workspace is implied.
 
 ## Capture boundary
 
@@ -141,7 +141,7 @@ bodyCompleteness = complete | partial | none | unknown
 
 ## Request and header completeness
 
-The collector saves both ordinary CDP fields and ExtraInfo fields:
+The collector saves ordinary CDP fields and queues every ExtraInfo event by redirect hop:
 
 ```text
 Network.requestWillBeSent request.headers
@@ -156,9 +156,33 @@ A request records:
 headersCompleteness
 bodyCompleteness
 requestSnapshotIntegrity
+replayReadiness
 ```
 
-This lets a replay tool distinguish a useful browser snapshot from a complete wire-level request. Multipart, file, binary, or omitted post data must not be described as exact body bytes.
+Finalize waits for expected ExtraInfo with a bounded deadline. Late ExtraInfo received immediately before `loadingFinished` is included in the final snapshot. `requestSnapshotIntegrity` uses the weakest headers/body dimension: complete headers plus a partial `cdp-postData` body remains partial, while a body-less request can be complete. `replayReadiness` separately reports `ready`, `partial`, or `not-ready`. Multipart, file, binary, or omitted post data must not be described as exact body bytes.
+
+## Collector-side event predicates
+
+`get_stream_status` can receive:
+
+```text
+eventPredicate = exact_data | event_name | json_path_equals
+afterEventIndex
+requestId (optional)
+```
+
+The collector scans the complete on-disk `events.jsonl` / `eventsource.jsonl` sequence. It does not depend on bounded recent-event summaries, so a target remains matchable after dozens of later events. MCP returns only:
+
+```text
+matched
+matchedEventIndex
+matchedRequestId
+matchedSource
+```
+
+The matching event body is not returned through MCP.
+
+Every state change visible to `get_stream_status` increments `capture.version`, including semantic-only EventSource events, parsed SSE completion, terminal transitions, parser degradation, request finalize, artifact/integrity changes, and capture stop/failure.
 
 ## Credential artifacts
 
@@ -268,7 +292,13 @@ completedMonotonicTimeSeconds
 completedWallTimeMs
 ```
 
-This supports targeted workspace reads from `raw.bin` without loading an entire stream into GPT context.
+This supports targeted local-evidence reads from `raw.bin` without loading an entire stream into GPT context.
+
+`captureArmedWallTimeMs` is recorded directly at `start_stream_capture`. `captureArmedMonotonicTimeSeconds` is optional and is only a page-network clock reference, not a substitute for the actual arm wall time.
+
+## Stable page selection
+
+Page listings return a stable process-lifetime `pageId` in addition to the current `pageIdx`. Higher-level orchestrators should save `pageId`, select by ID on later experiments, and verify that its URL still matches. `pageIdx` remains display and initial-discovery metadata only.
 
 ## Parser degradation
 
@@ -280,7 +310,7 @@ Only active `armed` or `capturing` captures are changed when a page closes. A st
 
 ## Downstream wait contract
 
-Polling `get_stream_status` is available to ordinary MCP clients. A higher-level private adapter should expose an internal wait method rather than a GPT-visible Action:
+Polling `get_stream_status` is available to ordinary MCP clients. A higher-level private adapter should expose an internal wait method rather than a GPT-visible Action. For body predicates it passes `eventPredicate` and the last `afterEventIndex`; the collector returns only match metadata:
 
 ```text
 waitForStreamCondition(
