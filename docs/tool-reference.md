@@ -123,7 +123,7 @@ content is kept for human-readable compatibility.
 
 ### `get_stream_status`
 
-**Description:** Inspect bounded status for a global stream capture ID, independent of the currently selected page. It returns capture/request summaries, workspace-relative artifact paths, bounded recent event summaries, and optionally bounded recent chunk offsets. It never returns event bodies, raw bytes, Base64, or operating-system absolute paths.
+**Description:** Ordinary MCP primitive that returns bounded status for a global capture ID. It never returns event bodies, credentials, raw bytes, Base64, payload artifacts, or host absolute paths. Full evidence and the complete payload index remain in capture.json and request metadata files.
 
 **Parameters:**
 
@@ -175,20 +175,20 @@ content is kept for human-readable compatibility.
 
 ### `start_stream_capture`
 
-**Description:** Arm streaming HTTP capture for the selected page. The server requires --allowedRoots, allocates a globally unique directory under the first allowed root, decodes CDP Base64 internally, and returns only an opaque capture ID plus workspace-relative artifact metadata. Application code should orchestrate start, browser action, wait, and stop atomically; do not expose this sequence as separate user-managed GPT Actions.
+**Description:** Ordinary MCP primitive that arms stream capture for the selected page. The deployment must configure --allowedRoots and --streamArtifactRoot; the server allocates the directory. In --toolExposureMode gpt-action this tool is hidden from tools/list because a downstream runBrowserExperiment(capture_flow) backend must own the entire start/action/wait/stop lifecycle.
 
 **Parameters:**
 
-- **methods** (array) _(optional)_: Optional HTTP method filter, such as ["POST"].
-- **mimeTypes** (array) _(optional)_: Response MIME prefixes to capture. Defaults to ["text/event-stream"].
-- **resourceTypes** (array) _(optional)_: Optional CDP/Playwright resource-type filter, such as ["fetch","eventsource"].
-- **urlFilter** (string) _(optional)_: Only capture response URLs containing this substring.
+- **methods** (array) _(optional)_
+- **mimeTypes** (array) _(optional)_
+- **resourceTypes** (array) _(optional)_
+- **urlFilter** (string) _(optional)_
 
 ---
 
 ### `stop_stream_capture`
 
-**Description:** Stop a global stream capture ID regardless of the currently selected page. The call waits for streamResourceContent activation, queued chunks, incremental parsing, artifact writes, and atomic metadata finalization. It returns the final capture summary plus a bounded artifact index; the complete index is in capture.json.
+**Description:** Ordinary MCP primitive that stops a global capture ID and waits for activation settlement, queued chunks, network snapshot artifacts, open-file writes, and atomic manifests. It returns only capture.json plus one request metadata artifact per request. In GPT Action deployments this tool is hidden and the backend invokes the collector internally.
 
 **Parameters:**
 
@@ -425,6 +425,31 @@ content is kept for human-readable compatibility.
   Maximum on-disk bytes reserved for one streaming-response capture. Defaults to 536870912 (512 MiB). Exceeding the quota marks the capture failed and records explicit truncation statistics.
   - **Type:** number
   - **Default:** `536870912`
+
+- **`--streamArtifactRoot`**
+  Deployment-controlled allowed-root selector used for stream artifacts. Accepts an allowed-root index such as "0" or an exact configured allowed-root path. Required before stream capture can start.
+  - **Type:** string
+
+- **`--streamActivationTimeoutMs`**
+  Internal timeout for Network.streamResourceContent activation. Defaults to 10000ms. Timeout produces a finalized failed or semantic-only manifest instead of leaving a request permanently activating.
+  - **Type:** number
+  - **Default:** `10000`
+
+- **`--streamPendingMaxBytes`**
+  Maximum in-memory bytes queued while streamResourceContent activation is pending. Defaults to 8388608 (8 MiB). Exceeding it fails activation explicitly.
+  - **Type:** number
+  - **Default:** `8388608`
+
+- **`--streamMaxSseEventBytes`**
+  Maximum bytes retained by the semantic SSE parser for one event or incomplete tail. Raw capture continues after semantic parsing degrades. Defaults to 8388608 (8 MiB).
+  - **Type:** number
+  - **Default:** `8388608`
+
+- **`--toolExposureMode`**
+  Tool exposure profile. "mcp" exposes stream lifecycle primitives. "gpt-action" hides them from tools/list so a downstream Action can expose only one atomic capture_flow operation.
+  - **Type:** string
+  - **Choices:** `mcp`, `gpt-action`
+  - **Default:** `mcp`
 
 - **`--cloak`**
   Use CloakBrowser stealth-patched Chromium instead of system Chrome. Adds source-level fingerprint patches (canvas/WebGL/audio/GPU). Binary auto-downloads (~200MB) on first use. Identity is persisted per profile in <profile>/.cloak-seed.

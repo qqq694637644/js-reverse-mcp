@@ -16,6 +16,7 @@ import {
   parseSseEvents,
   StreamCollector,
   type StreamCaptureLocation,
+  type StreamCollectorLimits,
 } from '../src/StreamCollector.js';
 import type {
   BrowserContext,
@@ -56,6 +57,12 @@ function createFixture(
       pageIndex: number,
     ) => Promise<{bufferedData?: string}>;
     maxDiskBytesPerCapture?: number;
+    collectorOptions?: Partial<StreamCollectorLimits>;
+    requestPostData?: string;
+    resolveNetworkRequestId?: (
+      page: Page,
+      cdpRequestId: string,
+    ) => number | undefined;
   } = {},
 ) {
   const pages: Page[] = [];
@@ -87,6 +94,8 @@ function createFixture(
       maxDiskBytesPerCapture: options.maxDiskBytesPerCapture ?? 1024 * 1024,
       maxRecentChunksPerRequest: 10,
       maxRecentEventsPerRequest: 10,
+      resolveNetworkRequestId: options.resolveNetworkRequestId,
+      ...options.collectorOptions,
     },
   );
 
@@ -142,6 +151,9 @@ function createFixture(
             ) ?? Promise.resolve({bufferedData: ''})
           );
         }
+        if (method === 'Network.getRequestPostData') {
+          return {postData: options.requestPostData ?? ''};
+        }
         return {};
       },
       emit(event: string, payload: unknown) {
@@ -178,6 +190,20 @@ function emitRequestStart(
     method?: string;
     type?: string;
     mimeType?: string;
+    requestHeaders?: Record<string, string>;
+    postData?: string;
+    hasPostData?: boolean;
+    initiator?: Record<string, unknown>;
+    wallTime?: number;
+    responseStatus?: number;
+    responseStatusText?: string;
+    responseHeaders?: Record<string, string>;
+    redirectResponse?: {
+      url: string;
+      status: number;
+      statusText: string;
+      headers: Record<string, string>;
+    };
   } = {},
 ): string {
   const requestId = options.requestId ?? 'stream-1';
@@ -187,14 +213,29 @@ function emitRequestStart(
   session.emit('Network.requestWillBeSent', {
     requestId,
     timestamp: 1,
+    wallTime: options.wallTime ?? 1_700_000_000,
     type,
-    request: {url, method},
+    initiator: options.initiator ?? {type: 'script'},
+    redirectResponse: options.redirectResponse,
+    request: {
+      url,
+      method,
+      headers: options.requestHeaders ?? {'x-test': 'request'},
+      postData: options.postData,
+      hasPostData: options.hasPostData,
+    },
   });
   session.emit('Network.responseReceived', {
     requestId,
     timestamp: 2,
     type,
-    response: {url, mimeType: options.mimeType ?? 'text/event-stream'},
+    response: {
+      url,
+      mimeType: options.mimeType ?? 'text/event-stream',
+      status: options.responseStatus ?? 200,
+      statusText: options.responseStatusText ?? 'OK',
+      headers: options.responseHeaders ?? {'content-type': 'text/event-stream'},
+    },
   });
   return requestId;
 }
@@ -235,6 +276,24 @@ function emitFinished(
   });
 }
 
+function emitFailed(
+  session: MockSession,
+  requestId: string,
+  options: {
+    timestamp?: number;
+    canceled?: boolean;
+    errorText?: string;
+  } = {},
+): void {
+  session.emit('Network.loadingFailed', {
+    requestId,
+    timestamp: options.timestamp ?? 5,
+    type: 'Fetch',
+    canceled: options.canceled ?? false,
+    errorText: options.errorText ?? 'net::ERR_FAILED',
+  });
+}
+
 async function flushMicrotasks(): Promise<void> {
   await new Promise(resolve => setTimeout(resolve, 0));
 }
@@ -244,10 +303,14 @@ async function createLocation(name: string): Promise<{
   location: StreamCaptureLocation;
 }> {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'stream-collector-'));
+  const rootPath = await fs.realpath(root);
   const relativeDir = path.join('captures', name);
-  const absoluteDir = path.join(root, relativeDir);
+  const absoluteDir = path.join(rootPath, relativeDir);
   await fs.mkdir(absoluteDir, {recursive: true});
-  return {root, location: {rootIndex: 0, absoluteDir, relativeDir}};
+  return {
+    root: rootPath,
+    location: {rootIndex: 0, rootPath, absoluteDir, relativeDir},
+  };
 }
 
 function artifactPath(root: string, artifact: {relativePath: string}): string {
@@ -325,7 +388,6 @@ test('activation barrier writes bufferedData before chunks received while activa
     });
     emitFinished(control.session, requestId);
     await collector.stopCapture(capture.id);
-
     const raw = capture.requests[0].artifacts.find(
       artifact => artifact.kind === 'raw_bytes',
     )!;
@@ -366,10 +428,10 @@ test('loadingFinished before activation waits for bufferedData and pending chunk
   }
 });
 
-test('stop before activation waits for bufferedData and finalizes metadata', async () => {
-  const activation = deferred<{bufferedData?: string}>();
+test('stop interrupts an unfinished activation and still finalizes metadata', async () => {
   const {collector, addPage} = createFixture({
-    streamResourceContent: () => activation.promise,
+    streamResourceContent: () => new Promise(() => undefined),
+    collectorOptions: {activationTimeoutMs: 10_000},
   });
   const control = addPage();
   const {root, location} = await createLocation('stop-before-activation');
@@ -377,20 +439,19 @@ test('stop before activation waits for bufferedData and finalizes metadata', asy
     await collector.addPage(control.page);
     const capture = await collector.startCapture(control.page, {}, location);
     emitRequestStart(control.session);
-    const stopPromise = collector.stopCapture(capture.id);
-    activation.resolve({
-      bufferedData: Buffer.from('data: captured-before-stop\n\n').toString(
-        'base64',
-      ),
-    });
-    const stopped = await stopPromise;
-    assert.equal(stopped.status, 'stopped');
-    assert.equal(stopped.requests[0].status, 'stopped');
+    const stopped = await collector.stopCapture(capture.id);
+    assert.equal(stopped.status, 'failed');
+    assert.equal(stopped.requests[0].status, 'failed');
+    assert.equal(stopped.requests[0].integrityStatus, 'failed');
+    assert.equal(stopped.requests[0].terminalReason, 'collector_stop');
     const manifest = JSON.parse(
       await fs.readFile(artifactPath(root, stopped.metadataArtifact), 'utf8'),
-    ) as {status: string; requests: Array<{rawEventCount: number}>};
-    assert.equal(manifest.status, 'stopped');
-    assert.equal(manifest.requests[0].rawEventCount, 1);
+    ) as {
+      status: string;
+      requests: Array<{status: string; integrityStatus: string}>;
+    };
+    assert.equal(manifest.status, 'failed');
+    assert.equal(manifest.requests[0].integrityStatus, 'failed');
   } finally {
     collector.dispose();
     await fs.rm(root, {recursive: true, force: true});
@@ -467,7 +528,7 @@ test('all strict large Base64 candidates become unique payload artifacts without
 });
 
 test('disk quota failure is explicit and never reported as a normal finish', async () => {
-  const {collector, addPage} = createFixture({maxDiskBytesPerCapture: 40});
+  const {collector, addPage} = createFixture({maxDiskBytesPerCapture: 16_000});
   const control = addPage();
   const {root, location} = await createLocation('quota');
   try {
@@ -475,7 +536,7 @@ test('disk quota failure is explicit and never reported as a normal finish', asy
     const capture = await collector.startCapture(control.page, {}, location);
     const requestId = emitRequestStart(control.session);
     await flushMicrotasks();
-    emitText(control.session, requestId, 'data: this-is-too-large\n\n', 3);
+    emitText(control.session, requestId, `data: ${'x'.repeat(20_000)}\n\n`, 3);
     emitText(control.session, requestId, 'data: dropped-too\n\n', 4);
     emitFinished(control.session, requestId, 5);
     const stopped = await collector.stopCapture(capture.id);
@@ -604,6 +665,445 @@ test('capture manifest contains only relative artifact paths', async () => {
     );
   } finally {
     collector.dispose();
+    await fs.rm(root, {recursive: true, force: true});
+  }
+});
+
+test('activation timeout finalizes a failed fetch request instead of hanging', async () => {
+  const {collector, addPage} = createFixture({
+    streamResourceContent: () => new Promise(() => undefined),
+    collectorOptions: {activationTimeoutMs: 20},
+  });
+  const control = addPage();
+  const {root, location} = await createLocation('activation-timeout');
+  try {
+    await collector.addPage(control.page);
+    const capture = await collector.startCapture(control.page, {}, location);
+    const requestId = emitRequestStart(control.session);
+    emitFinished(control.session, requestId, 4);
+    const stopped = await collector.stopCapture(capture.id);
+    const request = stopped.requests[0];
+    assert.equal(request.status, 'failed');
+    assert.equal(request.integrityStatus, 'failed');
+    assert.equal(request.terminalReason, 'activation_timeout');
+    assert.equal(request.failure?.code, 'ACTIVATION_TIMEOUT');
+    assert.match(request.streamResourceContentError ?? '', /timed out/i);
+    await fs.stat(artifactPath(root, stopped.metadataArtifact));
+  } finally {
+    await collector.dispose();
+    await fs.rm(root, {recursive: true, force: true});
+  }
+});
+
+test('pending chunks are bounded while activation is unresolved', async () => {
+  const {collector, addPage} = createFixture({
+    streamResourceContent: () => new Promise(() => undefined),
+    collectorOptions: {
+      activationTimeoutMs: 10_000,
+      maxPendingBytesPerRequest: 16,
+    },
+  });
+  const control = addPage();
+  const {root, location} = await createLocation('pending-limit');
+  try {
+    await collector.addPage(control.page);
+    const capture = await collector.startCapture(control.page, {}, location);
+    const requestId = emitRequestStart(control.session);
+    emitBytes(control.session, requestId, Buffer.alloc(12, 1), 3);
+    emitBytes(control.session, requestId, Buffer.alloc(12, 2), 4);
+    await flushMicrotasks();
+    emitFinished(control.session, requestId, 5);
+    await collector.stopCapture(capture.id);
+    const request = capture.requests[0];
+    assert.equal(request.status, 'failed');
+    assert.equal(request.failure?.code, 'PENDING_BUFFER_LIMIT');
+    assert.equal(request.pendingBytesPeak, 12);
+    assert.ok((request.truncation?.droppedChunkCount ?? 0) >= 1);
+    assert.ok((request.truncation?.droppedBytes ?? 0) >= 12);
+  } finally {
+    await collector.dispose();
+    await fs.rm(root, {recursive: true, force: true});
+  }
+});
+
+test('fetch activation failure cannot be reported as a successful finish', async () => {
+  const {collector, addPage} = createFixture({
+    streamResourceContent: async () => {
+      throw new Error('Method unavailable');
+    },
+  });
+  const control = addPage();
+  const {root, location} = await createLocation('activation-failed');
+  try {
+    await collector.addPage(control.page);
+    const capture = await collector.startCapture(control.page, {}, location);
+    const requestId = emitRequestStart(control.session, {type: 'Fetch'});
+    await flushMicrotasks();
+    emitFinished(control.session, requestId, 4);
+    await collector.stopCapture(capture.id);
+    const request = capture.requests[0];
+    assert.equal(request.status, 'failed');
+    assert.equal(request.integrityStatus, 'failed');
+    assert.equal(request.failure?.code, 'ACTIVATION_ERROR');
+  } finally {
+    await collector.dispose();
+    await fs.rm(root, {recursive: true, force: true});
+  }
+});
+
+test('EventSource activation failure becomes semantic-only when mirror events exist', async () => {
+  const {collector, addPage} = createFixture({
+    streamResourceContent: async () => {
+      throw new Error('Method unavailable');
+    },
+  });
+  const control = addPage();
+  const {root, location} = await createLocation('semantic-only');
+  try {
+    await collector.addPage(control.page);
+    const capture = await collector.startCapture(control.page, {}, location);
+    const requestId = emitRequestStart(control.session, {
+      method: 'GET',
+      type: 'EventSource',
+    });
+    await flushMicrotasks();
+    control.session.emit('Network.eventSourceMessageReceived', {
+      requestId,
+      timestamp: 3,
+      eventName: 'message',
+      eventId: '1',
+      data: '{"sequence":1}',
+    });
+    emitFinished(control.session, requestId, 4);
+    await collector.stopCapture(capture.id);
+    const request = capture.requests[0];
+    assert.equal(request.status, 'finished');
+    assert.equal(request.integrityStatus, 'semantic-only');
+    assert.equal(request.primaryEventSource, 'eventsource');
+    assert.equal(request.semanticEventCount, 1);
+  } finally {
+    await collector.dispose();
+    await fs.rm(root, {recursive: true, force: true});
+  }
+});
+
+test('user cancellation is a distinct terminal state', async () => {
+  const {collector, addPage} = createFixture();
+  const control = addPage();
+  const {root, location} = await createLocation('canceled');
+  try {
+    await collector.addPage(control.page);
+    const capture = await collector.startCapture(control.page, {}, location);
+    const requestId = emitRequestStart(control.session);
+    await flushMicrotasks();
+    emitText(control.session, requestId, 'data: partial\n\n', 3);
+    emitFailed(control.session, requestId, {
+      timestamp: 4,
+      canceled: true,
+      errorText: 'net::ERR_ABORTED',
+    });
+    await collector.stopCapture(capture.id);
+    const request = capture.requests[0];
+    assert.equal(request.status, 'canceled');
+    assert.equal(request.terminalReason, 'user_cancel');
+    assert.equal(request.failure, undefined);
+    assert.equal(request.integrityStatus, 'complete');
+  } finally {
+    await collector.dispose();
+    await fs.rm(root, {recursive: true, force: true});
+  }
+});
+
+test('request replay snapshot contains headers, body, response, initiator, redirects, and reqid correlation', async () => {
+  const {collector, addPage} = createFixture({
+    requestPostData: '{"from":"cdp"}',
+    resolveNetworkRequestId: (_page, requestId) =>
+      requestId === 'stream-1' ? 77 : undefined,
+  });
+  const control = addPage();
+  const {root, location} = await createLocation('request-snapshot');
+  try {
+    await collector.addPage(control.page);
+    const capture = await collector.startCapture(control.page, {}, location);
+    const requestId = emitRequestStart(control.session, {
+      requestHeaders: {authorization: 'Bearer local-test', 'x-client': 'test'},
+      hasPostData: true,
+      initiator: {type: 'script', url: 'https://example.test/app.js'},
+      responseStatus: 201,
+      responseStatusText: 'Created',
+      responseHeaders: {
+        'content-type': 'text/event-stream',
+        'x-server': 'test',
+      },
+      redirectResponse: {
+        url: 'https://example.test/old',
+        status: 307,
+        statusText: 'Temporary Redirect',
+        headers: {location: '/api/stream'},
+      },
+    });
+    await flushMicrotasks();
+    emitText(control.session, requestId, 'data: [DONE]\n\n', 3);
+    emitFinished(control.session, requestId, 4);
+    await collector.stopCapture(capture.id);
+    const request = capture.requests[0];
+    assert.equal(request.networkRequestId, 77);
+    assert.equal(request.responseStatus, 201);
+    const byKind = (kind: string) =>
+      request.artifacts.find(artifact => artifact.kind === kind)!;
+    const headers = JSON.parse(
+      await fs.readFile(artifactPath(root, byKind('request_headers')), 'utf8'),
+    ) as Record<string, string>;
+    assert.equal(headers.authorization, 'Bearer local-test');
+    assert.equal(
+      await fs.readFile(artifactPath(root, byKind('request_body')), 'utf8'),
+      '{"from":"cdp"}',
+    );
+    const response = JSON.parse(
+      await fs.readFile(artifactPath(root, byKind('response_headers')), 'utf8'),
+    ) as {status: number; headers: Record<string, string>};
+    assert.equal(response.status, 201);
+    assert.equal(response.headers['x-server'], 'test');
+    const initiator = JSON.parse(
+      await fs.readFile(artifactPath(root, byKind('initiator')), 'utf8'),
+    ) as {url: string};
+    assert.equal(initiator.url, 'https://example.test/app.js');
+    const redirects = JSON.parse(
+      await fs.readFile(artifactPath(root, byKind('redirects')), 'utf8'),
+    ) as Array<{status: number}>;
+    assert.equal(redirects[0].status, 307);
+  } finally {
+    await collector.dispose();
+    await fs.rm(root, {recursive: true, force: true});
+  }
+});
+
+test('events include byte ranges, chunk ranges, and monotonic/wall times', async () => {
+  const {collector, addPage} = createFixture();
+  const control = addPage();
+  const {root, location} = await createLocation('event-ranges');
+  try {
+    await collector.addPage(control.page);
+    const capture = await collector.startCapture(control.page, {}, location);
+    const requestId = emitRequestStart(control.session, {
+      wallTime: 1_700_000_000,
+    });
+    await flushMicrotasks();
+    emitText(control.session, requestId, 'data: hel', 3);
+    emitText(control.session, requestId, 'lo\n\n', 4);
+    emitFinished(control.session, requestId, 5);
+    await collector.stopCapture(capture.id);
+    const request = capture.requests[0];
+    assert.equal(request.startedMonotonicTimeSeconds, 1);
+    assert.equal(request.startedWallTimeMs, 1_700_000_000_000);
+    assert.equal(request.endedMonotonicTimeSeconds, 5);
+    assert.equal(request.endedWallTimeMs, 1_700_000_004_000);
+    const eventsArtifact = request.artifacts.find(
+      artifact => artifact.kind === 'events',
+    )!;
+    const [event] = await readJsonLines(artifactPath(root, eventsArtifact));
+    assert.equal(event.rawByteStart, 0);
+    assert.equal(event.rawByteEnd, Buffer.byteLength('data: hello\n'));
+    assert.equal(event.firstChunkIndex, 0);
+    assert.equal(event.lastChunkIndex, 1);
+    assert.equal(event.firstByteMonotonicTimeSeconds, 3);
+    assert.equal(event.completedMonotonicTimeSeconds, 4);
+    assert.equal(event.firstByteWallTimeMs, 1_700_000_002_000);
+    assert.equal(event.completedWallTimeMs, 1_700_000_003_000);
+  } finally {
+    await collector.dispose();
+    await fs.rm(root, {recursive: true, force: true});
+  }
+});
+
+test('bounded parser handles BOM and mixed newline styles', () => {
+  const parsed = parseSseEvents(
+    Buffer.concat([
+      Buffer.from([0xef, 0xbb, 0xbf]),
+      Buffer.from('data: one\r\rdata: two\r\n\r\ndata: three\n\n'),
+    ]),
+  );
+  assert.deepEqual(
+    parsed.events.map(event => event.data),
+    ['one', 'two', 'three'],
+  );
+});
+
+test('oversized or unterminated SSE degrades semantic parsing but preserves raw bytes', async () => {
+  const {collector, addPage} = createFixture({
+    collectorOptions: {
+      maxSseEventBytes: 32,
+      maxIncompleteTailBytes: 32,
+    },
+  });
+  const control = addPage();
+  const {root, location} = await createLocation('parser-degraded');
+  try {
+    await collector.addPage(control.page);
+    const capture = await collector.startCapture(control.page, {}, location);
+    const requestId = emitRequestStart(control.session);
+    await flushMicrotasks();
+    const raw = Buffer.from(`data: ${'x'.repeat(128)}`);
+    emitBytes(control.session, requestId, raw, 3);
+    emitFinished(control.session, requestId, 4);
+    await collector.stopCapture(capture.id);
+    const request = capture.requests[0];
+    assert.equal(request.parseStatus, 'degraded');
+    assert.equal(request.integrityStatus, 'partial');
+    assert.match(request.parseDegradedReason ?? '', /exceeded/i);
+    const rawArtifact = request.artifacts.find(
+      artifact => artifact.kind === 'raw_bytes',
+    )!;
+    assert.deepEqual(await fs.readFile(artifactPath(root, rawArtifact)), raw);
+  } finally {
+    await collector.dispose();
+    await fs.rm(root, {recursive: true, force: true});
+  }
+});
+
+test('invalid UTF-8 is recorded as parse degradation while raw bytes remain exact', async () => {
+  const {collector, addPage} = createFixture();
+  const control = addPage();
+  const {root, location} = await createLocation('invalid-utf8');
+  try {
+    await collector.addPage(control.page);
+    const capture = await collector.startCapture(control.page, {}, location);
+    const requestId = emitRequestStart(control.session);
+    await flushMicrotasks();
+    const raw = Buffer.from([
+      0x64, 0x61, 0x74, 0x61, 0x3a, 0x20, 0xff, 0x0a, 0x0a,
+    ]);
+    emitBytes(control.session, requestId, raw, 3);
+    emitFinished(control.session, requestId, 4);
+    await collector.stopCapture(capture.id);
+    const request = capture.requests[0];
+    assert.equal(request.invalidUtf8Count, 1);
+    assert.equal(request.parseStatus, 'degraded');
+    assert.equal(request.integrityStatus, 'partial');
+    const rawArtifact = request.artifacts.find(
+      artifact => artifact.kind === 'raw_bytes',
+    )!;
+    assert.deepEqual(await fs.readFile(artifactPath(root, rawArtifact)), raw);
+  } finally {
+    await collector.dispose();
+    await fs.rm(root, {recursive: true, force: true});
+  }
+});
+
+test('request and event count limits are explicit', async () => {
+  const {collector, addPage} = createFixture({
+    collectorOptions: {maxRequestsPerCapture: 1, maxEventsPerRequest: 1},
+  });
+  const control = addPage();
+  const {root, location} = await createLocation('count-limits');
+  try {
+    await collector.addPage(control.page);
+    const capture = await collector.startCapture(control.page, {}, location);
+    const first = emitRequestStart(control.session, {requestId: 'first'});
+    await flushMicrotasks();
+    emitText(control.session, first, 'data: one\n\ndata: two\n\n', 3);
+    emitFinished(control.session, first, 4);
+    emitRequestStart(control.session, {requestId: 'second'});
+    await collector.stopCapture(capture.id);
+    assert.equal(capture.requests.length, 1);
+    assert.equal(capture.status, 'failed');
+    assert.equal(capture.truncation?.reason, 'request_limit');
+    assert.equal(capture.requests[0].parseStatus, 'raw-only');
+    assert.equal(capture.requests[0].truncation?.reason, 'event_limit');
+  } finally {
+    await collector.dispose();
+    await fs.rm(root, {recursive: true, force: true});
+  }
+});
+
+test('async dispose waits for active capture finalization', async () => {
+  const {collector, addPage} = createFixture({
+    streamResourceContent: () => new Promise(() => undefined),
+    collectorOptions: {activationTimeoutMs: 10_000, shutdownTimeoutMs: 500},
+  });
+  const control = addPage();
+  const {root, location} = await createLocation('dispose');
+  try {
+    await collector.addPage(control.page);
+    const capture = await collector.startCapture(control.page, {}, location);
+    emitRequestStart(control.session);
+    await collector.dispose({timeoutMs: 500, reason: 'test shutdown'});
+    assert.equal(capture.status, 'failed');
+    assert.equal(capture.requests[0].status, 'failed');
+    await fs.stat(artifactPath(root, capture.metadataArtifact));
+  } finally {
+    await fs.rm(root, {recursive: true, force: true});
+  }
+});
+
+test('critical artifact initialization failure fails the request and capture', async () => {
+  const {collector, addPage} = createFixture();
+  const control = addPage();
+  const {root, location} = await createLocation('artifact-init-failure');
+  try {
+    await fs.writeFile(
+      path.join(location.absoluteDir, 'request-0001'),
+      'block',
+    );
+    await collector.addPage(control.page);
+    const capture = await collector.startCapture(control.page, {}, location);
+    const requestId = emitRequestStart(control.session);
+    await flushMicrotasks();
+    emitFinished(control.session, requestId, 4);
+    await collector.stopCapture(capture.id);
+    const request = capture.requests[0];
+    assert.equal(request.status, 'failed');
+    assert.equal(request.integrityStatus, 'failed');
+    assert.equal(request.terminalReason, 'artifact_error');
+    assert.equal(request.failure?.code, 'ARTIFACT_ERROR');
+    assert.ok(
+      request.artifacts.some(artifact => artifact.writeStatus === 'failed'),
+    );
+  } finally {
+    await collector.dispose();
+    await fs.rm(root, {recursive: true, force: true});
+  }
+});
+
+test('payload and artifact limits omit extra payloads without leaking Base64', async () => {
+  const {collector, addPage} = createFixture({
+    collectorOptions: {
+      maxPayloadsPerRequest: 1,
+      maxArtifactsPerCapture: 20,
+    },
+  });
+  const control = addPage();
+  const {root, location} = await createLocation('payload-limit');
+  try {
+    await collector.addPage(control.page);
+    const capture = await collector.startCapture(control.page, {}, location);
+    const requestId = emitRequestStart(control.session);
+    await flushMicrotasks();
+    const first = Buffer.alloc(5000, 1).toString('base64');
+    const second = Buffer.alloc(5000, 2).toString('base64');
+    emitText(
+      control.session,
+      requestId,
+      `data: ${JSON.stringify({first, second})}\n\n`,
+      3,
+    );
+    emitFinished(control.session, requestId, 4);
+    await collector.stopCapture(capture.id);
+    const request = capture.requests[0];
+    assert.equal(request.integrityStatus, 'partial');
+    assert.equal(request.truncation?.reason, 'payload_limit');
+    assert.equal(
+      request.artifacts.filter(artifact => artifact.kind === 'payload').length,
+      1,
+    );
+    const events = request.artifacts.find(
+      artifact => artifact.kind === 'events',
+    )!;
+    const text = await fs.readFile(artifactPath(root, events), 'utf8');
+    assert.match(text, /\$payloadOmitted/);
+    assert.doesNotMatch(text, new RegExp(second.slice(0, 80)));
+  } finally {
+    await collector.dispose();
     await fs.rm(root, {recursive: true, force: true});
   }
 });

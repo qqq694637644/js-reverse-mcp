@@ -5,14 +5,20 @@
  */
 
 import {Buffer} from 'node:buffer';
-import {createHash, randomUUID, type Hash} from 'node:crypto';
-import * as fs from 'node:fs/promises';
+import {createHash, type Hash} from 'node:crypto';
+import {constants as fsConstants} from 'node:fs';
+import type * as fs from 'node:fs/promises';
 import path from 'node:path';
 
 import type {Protocol} from 'devtools-protocol';
 
 import {addCdpEventListener, removeCdpEventListener} from './CdpEvents.js';
 import type {CdpSessionProvider} from './CdpSessionProvider.js';
+import {
+  createSecureSubdirectory,
+  openSecureArtifactFile,
+  writeSecureAtomicArtifactFile,
+} from './LocalFileAccess.js';
 import {logger, redactLogValue} from './logger.js';
 import type {BrowserContext, Page} from './third_party/index.js';
 
@@ -21,8 +27,27 @@ export type StreamRequestStatus =
   | 'activating'
   | 'streaming'
   | 'finished'
+  | 'canceled'
   | 'stopped'
   | 'failed';
+export type StreamIntegrityStatus =
+  | 'complete'
+  | 'semantic-only'
+  | 'partial'
+  | 'failed';
+export type StreamParseStatus = 'complete' | 'degraded' | 'raw-only';
+export type StreamTerminalReason =
+  | 'completed'
+  | 'user_cancel'
+  | 'page_close'
+  | 'network_error'
+  | 'quota'
+  | 'collector_stop'
+  | 'activation_timeout'
+  | 'pending_limit'
+  | 'activation_error'
+  | 'artifact_error'
+  | 'shutdown_timeout';
 export type StreamEventSource = 'raw-stream' | 'eventsource';
 export type StreamEventRecordType = 'event' | 'heartbeat';
 
@@ -35,6 +60,7 @@ export interface StreamCaptureFilter {
 
 export interface StreamCaptureLocation {
   rootIndex: number;
+  rootPath: string;
   absoluteDir: string;
   relativeDir: string;
 }
@@ -49,6 +75,11 @@ export interface StreamArtifactFile {
     | 'chunks'
     | 'events'
     | 'eventsource_events'
+    | 'request_headers'
+    | 'request_body'
+    | 'response_headers'
+    | 'initiator'
+    | 'redirects'
     | 'payload';
   rootIndex: number;
   relativePath: string;
@@ -61,7 +92,8 @@ export interface StreamArtifactFile {
 
 export interface StreamChunkOffset {
   index: number;
-  timestamp: number;
+  monotonicTimeSeconds: number;
+  wallTimeMs?: number;
   dataLength: number;
   encodedDataLength: number;
   payloadBytes: number;
@@ -76,16 +108,26 @@ export interface StreamEventSummary {
   recordType: StreamEventRecordType;
   eventName?: string;
   done: boolean;
-  timestamp?: number;
   source: StreamEventSource;
   dataLength: number;
   payloadCount: number;
+  rawByteStart?: number;
+  rawByteEnd?: number;
+  completedWallTimeMs?: number;
 }
 
 export interface StreamTruncation {
-  truncatedAt: number;
-  reason: 'disk_quota_exceeded';
-  quotaBytes: number;
+  truncatedWallTimeMs: number;
+  reason:
+    | 'disk_quota_exceeded'
+    | 'pending_buffer_limit'
+    | 'request_limit'
+    | 'artifact_limit'
+    | 'payload_limit'
+    | 'event_limit'
+    | 'metadata_limit'
+    | 'activation_failure';
+  limit: number;
   droppedChunkCount: number;
   droppedBytes: number;
 }
@@ -94,19 +136,36 @@ export interface StreamFailure {
   errorText: string;
   canceled: boolean;
   blockedReason?: string;
-  code?: 'DISK_QUOTA_EXCEEDED' | 'PAGE_CLOSED' | 'STREAM_ERROR';
+  code:
+    | 'DISK_QUOTA_EXCEEDED'
+    | 'PAGE_CLOSED'
+    | 'NETWORK_ERROR'
+    | 'ACTIVATION_TIMEOUT'
+    | 'PENDING_BUFFER_LIMIT'
+    | 'ACTIVATION_ERROR'
+    | 'ARTIFACT_ERROR'
+    | 'SHUTDOWN_TIMEOUT';
 }
 
 export interface StreamRequest {
-  requestId: string;
+  cdpRequestId: string;
+  networkRequestId?: number;
   requestIndex: number;
   url: string;
   method: string;
   resourceType?: string;
   mimeType?: string;
+  responseStatus?: number;
+  responseStatusText?: string;
   status: StreamRequestStatus;
-  startedAt: number;
-  endedAt?: number;
+  terminalReason?: StreamTerminalReason;
+  integrityStatus: StreamIntegrityStatus;
+  parseStatus: StreamParseStatus;
+  parseDegradedReason?: string;
+  startedMonotonicTimeSeconds: number;
+  startedWallTimeMs?: number;
+  endedMonotonicTimeSeconds?: number;
+  endedWallTimeMs?: number;
   failure?: StreamFailure;
   streamResourceContentEnabled: boolean;
   streamResourceContentError?: string;
@@ -117,10 +176,11 @@ export interface StreamRequest {
   semanticEventCount: number;
   primaryEventSource: StreamEventSource | 'none';
   doneMarkerObserved: boolean;
-  parseErrors: number;
-  incompleteTailChars: number;
+  invalidUtf8Count: number;
+  incompleteTailBytes: number;
   rawBytes: number;
   diskBytesReserved: number;
+  pendingBytesPeak: number;
   truncation?: StreamTruncation;
   writeErrors: string[];
   artifacts: StreamArtifactFile[];
@@ -131,14 +191,15 @@ export interface StreamRequest {
 export interface StreamCapture {
   id: number;
   status: StreamCaptureStatus;
+  integrityStatus: StreamIntegrityStatus;
   filter: StreamCaptureFilter;
   artifactRootIndex: number;
   relativeDir: string;
   metadataArtifact: StreamArtifactFile;
   pageUrl: string;
   pageTitle?: string;
-  createdAt: number;
-  stoppedAt?: number;
+  createdWallTimeMs: number;
+  stoppedWallTimeMs?: number;
   requests: StreamRequest[];
   totalRawBytes: number;
   diskBytesReserved: number;
@@ -161,24 +222,59 @@ export interface SseEvent {
   comments: string[];
   done: boolean;
   source: StreamEventSource;
-  timestamp?: number;
+  invalidUtf8: boolean;
+  rawByteStart?: number;
+  rawByteEnd?: number;
+  decodedCharStart?: number;
+  decodedCharEnd?: number;
+  firstChunkIndex?: number;
+  lastChunkIndex?: number;
+  firstByteMonotonicTimeSeconds?: number;
+  firstByteWallTimeMs?: number;
+  completedMonotonicTimeSeconds?: number;
+  completedWallTimeMs?: number;
+}
+
+export interface StreamCollectorLimits {
+  maxCaptures: number;
+  maxDiskBytesPerCapture: number;
+  activationTimeoutMs: number;
+  maxPendingBytesPerRequest: number;
+  maxSseEventBytes: number;
+  maxIncompleteTailBytes: number;
+  maxRecentChunksPerRequest: number;
+  maxRecentEventsPerRequest: number;
+  maxRequestsPerCapture: number;
+  maxArtifactsPerCapture: number;
+  maxPayloadsPerRequest: number;
+  maxEventsPerRequest: number;
+  maxMetadataBytes: number;
+  shutdownTimeoutMs: number;
 }
 
 interface RequestMetadata {
+  cdpRequestId: string;
   url: string;
   method: string;
   resourceType?: string;
-}
-
-interface StreamCollectorLimits {
-  maxCaptures: number;
-  maxDiskBytesPerCapture: number;
-  maxRecentChunksPerRequest: number;
-  maxRecentEventsPerRequest: number;
+  headers: Protocol.Network.Headers;
+  postData?: string;
+  hasPostData?: boolean;
+  initiator?: Protocol.Network.Initiator;
+  redirects: Array<{
+    url: string;
+    status: number;
+    statusText: string;
+    headers: Protocol.Network.Headers;
+  }>;
+  startedMonotonicTimeSeconds: number;
+  startedWallTimeMs?: number;
+  monotonicToWallOffsetMs?: number;
 }
 
 interface PendingChunk {
-  timestamp: number;
+  monotonicTimeSeconds: number;
+  wallTimeMs?: number;
   dataLength: number;
   encodedDataLength: number;
   payload: Buffer;
@@ -186,37 +282,51 @@ interface PendingChunk {
 }
 
 interface RequestTerminal {
-  status: 'finished' | 'stopped' | 'failed';
-  endedAt: number;
+  status: 'finished' | 'canceled' | 'stopped' | 'failed';
+  reason: StreamTerminalReason;
+  endedMonotonicTimeSeconds?: number;
+  endedWallTimeMs: number;
   failure?: StreamFailure;
 }
 
 interface ArtifactRuntime {
   descriptor: StreamArtifactFile;
-  absolutePath: string;
+  relativeToRequestDir: string;
+  handle?: Awaited<ReturnType<typeof fs.open>>;
   hash: Hash;
+  criticality: 'critical' | 'supporting' | 'payload';
 }
 
 interface CaptureRuntime {
   page: Page;
-  absoluteDir: string;
-  metadataAbsolutePath: string;
+  location: StreamCaptureLocation;
   metadataChain: Promise<void>;
-  closePromise?: Promise<void>;
 }
 
 interface RequestRuntime {
   capture: StreamCapture;
+  page: Page;
+  client: Awaited<ReturnType<CdpSessionProvider['getSession']>>;
+  metadata: RequestMetadata;
   absoluteDir: string;
-  decoder: TextDecoder;
-  parser: IncrementalSseParser;
+  initializationPromise: Promise<void>;
+  snapshotPromise: Promise<void>;
+  parser: BoundedSseParser;
+  textDecoder: TextDecoder;
   rawOffset: number;
   payloadIndex: number;
+  payloadCount: number;
   nextSemanticEventIndex: number;
+  scheduledRawEvents: number;
+  scheduledSemanticEvents: number;
   writeChain: Promise<void>;
   activationPromise: Promise<void>;
-  activationResolved: boolean;
+  activationAbort: AbortController;
+  activationSettled: boolean;
+  activationSucceeded: boolean;
+  activationFailureReason?: StreamTerminalReason;
   pendingChunks: PendingChunk[];
+  pendingBytes: number;
   terminal?: RequestTerminal;
   finalized: boolean;
   finalizePromise?: Promise<void>;
@@ -224,9 +334,8 @@ interface RequestRuntime {
 }
 
 interface MaterializedPayload {
-  descriptor: Record<string, unknown>;
   artifact: StreamArtifactFile;
-  absolutePath: string;
+  relativeToRequestDir: string;
   bytes: Buffer;
 }
 
@@ -236,19 +345,89 @@ interface MaterializedEvent {
   summary: StreamEventSummary;
 }
 
+interface ParserFeedContext {
+  chunkIndex: number;
+  rawByteStart: number;
+  monotonicTimeSeconds: number;
+  wallTimeMs?: number;
+}
+
+interface EventState {
+  rawByteStart: number;
+  decodedCharStart: number;
+  firstChunkIndex: number;
+  lastChunkIndex: number;
+  firstByteMonotonicTimeSeconds: number;
+  firstByteWallTimeMs?: number;
+  completedMonotonicTimeSeconds: number;
+  completedWallTimeMs?: number;
+  rawBytes: number;
+  dataLines: string[];
+  comments: string[];
+  eventName?: string;
+  eventId?: string;
+  retry?: number;
+  invalidUtf8: boolean;
+}
+
 export const DEFAULT_STREAM_DISK_QUOTA_BYTES = 512 * 1024 * 1024;
+export const DEFAULT_STREAM_ACTIVATION_TIMEOUT_MS = 10_000;
+export const DEFAULT_STREAM_PENDING_MAX_BYTES = 8 * 1024 * 1024;
+export const DEFAULT_STREAM_MAX_SSE_EVENT_BYTES = 8 * 1024 * 1024;
+export const DEFAULT_STREAM_MAX_METADATA_BYTES = 8 * 1024 * 1024;
 export const MAX_RETAINED_STREAM_CAPTURES = 100;
 export const MAX_RECENT_STREAM_CHUNKS = 100;
 export const MAX_RECENT_STREAM_EVENTS = 20;
 
 const MAX_INLINE_EVENT_DATA_CHARS = 64 * 1024;
 const MIN_BASE64_ARTIFACT_CHARS = 4 * 1024;
+const DEFAULT_MAX_REQUESTS = 200;
+const DEFAULT_MAX_ARTIFACTS = 2_000;
+const DEFAULT_MAX_PAYLOADS = 500;
+const DEFAULT_MAX_EVENTS = 100_000;
+const DEFAULT_SHUTDOWN_TIMEOUT_MS = 4_500;
+const BASE_REQUEST_ARTIFACT_COUNT = 11;
+
+function getErrorText(error: unknown): string {
+  const message = error instanceof Error ? error.message : String(error);
+  return String(redactLogValue(message));
+}
+
+function toPortablePath(value: string): string {
+  return value.split(path.sep).join('/');
+}
+
+function toJsonLine(value: unknown): Buffer {
+  return Buffer.from(`${JSON.stringify(value)}\n`, 'utf8');
+}
+
+function bounded(value: string | undefined, max = 4096): string | undefined {
+  if (value === undefined || value.length <= max) {
+    return value;
+  }
+  return `${value.slice(0, max - 32)}…[truncated ${value.length - max + 32} chars]`;
+}
 
 function normalizedList(values?: string[]): string[] | undefined {
-  if (!values?.length) {
+  if (!values) {
     return undefined;
   }
+  if (values.length === 0) {
+    throw new Error('Stream filter arrays must contain at least one value.');
+  }
   return values.map(value => value.toLowerCase());
+}
+
+function normalizeFilter(filter: StreamCaptureFilter): StreamCaptureFilter {
+  normalizedList(filter.methods);
+  normalizedList(filter.resourceTypes);
+  normalizedList(filter.mimeTypes);
+  return {
+    urlFilter: filter.urlFilter,
+    methods: filter.methods,
+    resourceTypes: filter.resourceTypes,
+    mimeTypes: filter.mimeTypes ?? ['text/event-stream'],
+  };
 }
 
 function matchesFilter(
@@ -271,44 +450,191 @@ function matchesFilter(
     return false;
   }
   const mimeTypes = normalizedList(filter.mimeTypes);
-  return (
-    !mimeTypes ||
-    mimeTypes.some(expected =>
+  return Boolean(
+    mimeTypes?.some(expected =>
       (mimeType ?? '').toLowerCase().startsWith(expected),
-    )
+    ),
   );
 }
 
-function getErrorText(error: unknown): string {
-  const message = error instanceof Error ? error.message : String(error);
-  return String(redactLogValue(message));
+function wallTimeFromMonotonic(
+  monotonicTimeSeconds: number,
+  offsetMs?: number,
+): number | undefined {
+  return offsetMs === undefined
+    ? undefined
+    : monotonicTimeSeconds * 1000 + offsetMs;
 }
 
-function toJsonLine(value: unknown): Buffer {
-  return Buffer.from(`${JSON.stringify(value)}\n`, 'utf8');
+function decodeUtf8Line(bytes: Buffer): {text: string; invalid: boolean} {
+  try {
+    return {
+      text: new TextDecoder('utf-8', {fatal: true}).decode(bytes),
+      invalid: false,
+    };
+  } catch {
+    return {text: new TextDecoder('utf-8').decode(bytes), invalid: true};
+  }
 }
 
-function toPortablePath(value: string): string {
-  return value.split(path.sep).join('/');
-}
+class BoundedSseParser {
+  #maxEventBytes: number;
+  #maxIncompleteTailBytes: number;
+  #lineParts: Buffer[] = [];
+  #lineBytes = 0;
+  #lineStartOffset = 0;
+  #lineFirstChunkIndex = 0;
+  #lineFirstMonotonic = 0;
+  #lineFirstWall?: number;
+  #event?: EventState;
+  #nextIndex = 0;
+  #decodedCharCursor = 0;
+  #absoluteOffset = 0;
+  #pendingCr = false;
+  #bomHandled = false;
+  #degradedReason?: string;
 
-function parseSseBlock(
-  block: string,
-  index: number,
-  source: StreamEventSource,
-  timestamp?: number,
-): SseEvent | undefined {
-  const normalized = block.replaceAll('\r\n', '\n').replaceAll('\r', '\n');
-  const dataLines: string[] = [];
-  const comments: string[] = [];
-  let eventName: string | undefined;
-  let eventId: string | undefined;
-  let retry: number | undefined;
+  constructor(maxEventBytes: number, maxIncompleteTailBytes: number) {
+    this.#maxEventBytes = maxEventBytes;
+    this.#maxIncompleteTailBytes = maxIncompleteTailBytes;
+  }
 
-  for (const line of normalized.split('\n')) {
+  get degradedReason(): string | undefined {
+    return this.#degradedReason;
+  }
+
+  get incompleteTailBytes(): number {
+    return this.#event?.rawBytes ?? this.#lineBytes;
+  }
+
+  push(payload: Buffer, context: ParserFeedContext): SseEvent[] {
+    if (this.#degradedReason || payload.length === 0) {
+      this.#absoluteOffset += payload.length;
+      return [];
+    }
+    if (this.#absoluteOffset !== context.rawByteStart) {
+      this.#degrade('raw byte offsets became non-contiguous');
+      this.#absoluteOffset = context.rawByteStart + payload.length;
+      return [];
+    }
+    const events: SseEvent[] = [];
+    let index = 0;
+    if (this.#pendingCr) {
+      if (payload[0] === 0x0a) {
+        index = 1;
+        this.#absoluteOffset++;
+      }
+      this.#pendingCr = false;
+    }
+    while (index < payload.length && !this.#degradedReason) {
+      let delimiter = index;
+      while (
+        delimiter < payload.length &&
+        payload[delimiter] !== 0x0a &&
+        payload[delimiter] !== 0x0d
+      ) {
+        delimiter++;
+      }
+      if (delimiter > index) {
+        this.#appendLineBytes(payload.subarray(index, delimiter), context);
+        this.#absoluteOffset += delimiter - index;
+      }
+      if (delimiter >= payload.length) {
+        break;
+      }
+      const delimiterByte = payload[delimiter];
+      const lineEndOffset = this.#absoluteOffset;
+      this.#absoluteOffset++;
+      const event = this.#finishLine(lineEndOffset, context);
+      if (event) {
+        events.push(event);
+      }
+      index = delimiter + 1;
+      if (delimiterByte === 0x0d) {
+        if (index < payload.length && payload[index] === 0x0a) {
+          index++;
+          this.#absoluteOffset++;
+          this.#pendingCr = false;
+        } else {
+          this.#pendingCr = index >= payload.length;
+        }
+      }
+    }
+    return events;
+  }
+
+  #appendLineBytes(bytes: Buffer, context: ParserFeedContext): void {
+    if (this.#lineBytes === 0) {
+      this.#lineStartOffset = this.#absoluteOffset;
+      this.#lineFirstChunkIndex = context.chunkIndex;
+      this.#lineFirstMonotonic = context.monotonicTimeSeconds;
+      this.#lineFirstWall = context.wallTimeMs;
+    }
+    this.#lineParts.push(bytes);
+    this.#lineBytes += bytes.length;
+    const total = (this.#event?.rawBytes ?? 0) + this.#lineBytes;
+    if (total > this.#maxEventBytes) {
+      this.#degrade(`SSE event exceeded ${this.#maxEventBytes} bytes`);
+    } else if (total > this.#maxIncompleteTailBytes) {
+      this.#degrade(
+        `SSE incomplete tail exceeded ${this.#maxIncompleteTailBytes} bytes`,
+      );
+    }
+  }
+
+  #finishLine(
+    lineEndOffset: number,
+    context: ParserFeedContext,
+  ): SseEvent | undefined {
+    const lineBuffer = Buffer.concat(this.#lineParts, this.#lineBytes);
+    this.#lineParts = [];
+    this.#lineBytes = 0;
+    const {text: decoded, invalid} = decodeUtf8Line(lineBuffer);
+    let line = decoded;
+    if (!this.#bomHandled) {
+      this.#bomHandled = true;
+      if (line.charCodeAt(0) === 0xfeff) {
+        line = line.slice(1);
+      }
+    }
+    if (line.length === 0) {
+      const event = this.#finishEvent(this.#lineStartOffset, context);
+      this.#decodedCharCursor++;
+      this.#lineStartOffset = this.#absoluteOffset;
+      return event;
+    }
+    if (!this.#event) {
+      this.#event = {
+        rawByteStart: this.#lineStartOffset,
+        decodedCharStart: this.#decodedCharCursor,
+        firstChunkIndex: this.#lineFirstChunkIndex,
+        lastChunkIndex: context.chunkIndex,
+        firstByteMonotonicTimeSeconds: this.#lineFirstMonotonic,
+        firstByteWallTimeMs: this.#lineFirstWall,
+        completedMonotonicTimeSeconds: context.monotonicTimeSeconds,
+        completedWallTimeMs: context.wallTimeMs,
+        rawBytes: 0,
+        dataLines: [],
+        comments: [],
+        invalidUtf8: false,
+      };
+    }
+    const state = this.#event;
+    state.lastChunkIndex = context.chunkIndex;
+    state.completedMonotonicTimeSeconds = context.monotonicTimeSeconds;
+    state.completedWallTimeMs = context.wallTimeMs;
+    state.rawBytes = lineEndOffset + 1 - state.rawByteStart;
+    state.invalidUtf8 ||= invalid;
+    this.#consumeField(line, state);
+    this.#decodedCharCursor += line.length + 1;
+    this.#lineStartOffset = this.#absoluteOffset;
+    return undefined;
+  }
+
+  #consumeField(line: string, state: EventState): void {
     if (line.startsWith(':')) {
-      comments.push(line.slice(1).trimStart());
-      continue;
+      state.comments.push(line.slice(1).trimStart());
+      return;
     }
     const separator = line.indexOf(':');
     const field = separator === -1 ? line : line.slice(0, separator);
@@ -318,95 +644,69 @@ function parseSseBlock(
     }
     switch (field) {
       case 'data':
-        dataLines.push(value);
+        state.dataLines.push(value);
         break;
       case 'event':
-        eventName = value || 'message';
+        state.eventName = value || 'message';
         break;
       case 'id':
-        eventId = value;
+        state.eventId = value;
         break;
       case 'retry': {
         const parsed = Number(value);
         if (Number.isSafeInteger(parsed) && parsed >= 0) {
-          retry = parsed;
+          state.retry = parsed;
         }
         break;
       }
     }
   }
 
-  if (dataLines.length === 0 && comments.length === 0) {
-    return undefined;
-  }
-  const data = dataLines.join('\n');
-  const recordType: StreamEventRecordType =
-    dataLines.length === 0 && comments.length > 0 ? 'heartbeat' : 'event';
-  return {
-    index,
-    recordType,
-    eventName: recordType === 'event' ? (eventName ?? 'message') : undefined,
-    eventId,
-    data,
-    retry,
-    comments,
-    done: data.trim() === '[DONE]',
-    source,
-    timestamp,
-  };
-}
-
-function findSseSeparator(
-  text: string,
-): {index: number; length: number} | undefined {
-  const separators = ['\r\n\r\n', '\n\n', '\r\r'];
-  let found: {index: number; length: number} | undefined;
-  for (const separator of separators) {
-    const index = text.indexOf(separator);
-    if (index === -1) {
-      continue;
+  #finishEvent(
+    rawByteEnd: number,
+    context: ParserFeedContext,
+  ): SseEvent | undefined {
+    const state = this.#event;
+    this.#event = undefined;
+    if (!state) {
+      return undefined;
     }
-    if (
-      !found ||
-      index < found.index ||
-      (index === found.index && separator.length > found.length)
-    ) {
-      found = {index, length: separator.length};
+    if (state.dataLines.length === 0 && state.comments.length === 0) {
+      return undefined;
     }
-  }
-  return found;
-}
-
-class IncrementalSseParser {
-  #buffer = '';
-  #nextIndex = 0;
-
-  push(text: string, timestamp?: number): SseEvent[] {
-    this.#buffer += text;
-    const events: SseEvent[] = [];
-    while (true) {
-      const separator = findSseSeparator(this.#buffer);
-      if (!separator) {
-        break;
-      }
-      const block = this.#buffer.slice(0, separator.index);
-      this.#buffer = this.#buffer.slice(separator.index + separator.length);
-      const event = parseSseBlock(
-        block,
-        this.#nextIndex,
-        'raw-stream',
-        timestamp,
-      );
-      if (event) {
-        events.push(event);
-        this.#nextIndex++;
-      }
-    }
-    return events;
+    const data = state.dataLines.join('\n');
+    const recordType: StreamEventRecordType =
+      state.dataLines.length === 0 ? 'heartbeat' : 'event';
+    return {
+      index: this.#nextIndex++,
+      recordType,
+      eventName:
+        recordType === 'event' ? (state.eventName ?? 'message') : undefined,
+      eventId: state.eventId,
+      data,
+      retry: state.retry,
+      comments: state.comments,
+      done: data.trim() === '[DONE]',
+      source: 'raw-stream',
+      invalidUtf8: state.invalidUtf8,
+      rawByteStart: state.rawByteStart,
+      rawByteEnd,
+      decodedCharStart: state.decodedCharStart,
+      decodedCharEnd: this.#decodedCharCursor,
+      firstChunkIndex: state.firstChunkIndex,
+      lastChunkIndex: context.chunkIndex,
+      firstByteMonotonicTimeSeconds: state.firstByteMonotonicTimeSeconds,
+      firstByteWallTimeMs: state.firstByteWallTimeMs,
+      completedMonotonicTimeSeconds: context.monotonicTimeSeconds,
+      completedWallTimeMs: context.wallTimeMs,
+    };
   }
 
-  get incompleteTail(): string {
-    return this.#buffer;
+  #degrade(reason: string): void {
+    this.#degradedReason ??= reason;
+    this.#lineParts = [];
+    this.#lineBytes = 0;
+    this.#event = undefined;
   }
 }
 
@@ -414,9 +714,26 @@ export function parseSseEvents(data: Uint8Array): {
   events: SseEvent[];
   incompleteTail: string;
 } {
-  const parser = new IncrementalSseParser();
-  const events = parser.push(Buffer.from(data).toString('utf8'));
-  return {events, incompleteTail: parser.incompleteTail};
+  const bytes = Buffer.from(data);
+  const parser = new BoundedSseParser(
+    Math.max(bytes.length + 1, DEFAULT_STREAM_MAX_SSE_EVENT_BYTES),
+    Math.max(bytes.length + 1, DEFAULT_STREAM_MAX_SSE_EVENT_BYTES),
+  );
+  const events = parser.push(bytes, {
+    chunkIndex: 0,
+    rawByteStart: 0,
+    monotonicTimeSeconds: 0,
+    wallTimeMs: 0,
+  });
+  const normalized = bytes
+    .toString('utf8')
+    .replaceAll('\r\n', '\n')
+    .replaceAll('\r', '\n');
+  const pieces = normalized.split('\n\n');
+  const incompleteTail = normalized.endsWith('\n\n')
+    ? ''
+    : (pieces.at(-1) ?? '');
+  return {events, incompleteTail};
 }
 
 function detectMimeType(data: Buffer): {mimeType?: string; extension: string} {
@@ -450,16 +767,6 @@ function detectMimeType(data: Buffer): {mimeType?: string; extension: string} {
   if (data.length >= 5 && data.subarray(0, 5).toString('ascii') === '%PDF-') {
     return {mimeType: 'application/pdf', extension: 'pdf'};
   }
-  if (
-    data.length >= 12 &&
-    data.subarray(0, 4).toString('ascii') === 'RIFF' &&
-    data.subarray(8, 12).toString('ascii') === 'WAVE'
-  ) {
-    return {mimeType: 'audio/wav', extension: 'wav'};
-  }
-  if (data.length >= 3 && data.subarray(0, 3).toString('ascii') === 'ID3') {
-    return {mimeType: 'audio/mpeg', extension: 'mp3'};
-  }
   return {extension: 'bin'};
 }
 
@@ -487,11 +794,11 @@ function parseBase64Candidate(value: string):
     return undefined;
   }
   const bytes = Buffer.from(compact, 'base64');
-  if (bytes.length === 0) {
-    return undefined;
-  }
-  const canonical = bytes.toString('base64').replaceAll(/=+$/g, '');
-  if (canonical !== compact.replaceAll(/=+$/g, '')) {
+  if (
+    bytes.length === 0 ||
+    bytes.toString('base64').replaceAll(/=+$/g, '') !==
+      compact.replaceAll(/=+$/g, '')
+  ) {
     return undefined;
   }
   const detected = detectMimeType(bytes);
@@ -508,190 +815,35 @@ function createArtifact(
   kind: StreamArtifactFile['kind'],
   relativePath: string,
   suffix: string,
-): StreamArtifactFile {
+  criticality: ArtifactRuntime['criticality'],
+): ArtifactRuntime {
   return {
-    artifactId: `stream-${capture.id}-${suffix}`,
-    kind,
-    rootIndex: capture.artifactRootIndex,
-    relativePath: toPortablePath(relativePath),
-    bytes: 0,
-    writeStatus: 'pending',
-  };
-}
-
-function atomicWriteFile(filename: string, data: Buffer): Promise<void> {
-  return (async () => {
-    const temporary = `${filename}.${randomUUID()}.tmp`;
-    await fs.writeFile(temporary, data, {flag: 'wx', mode: 0o600});
-    try {
-      await fs.rename(temporary, filename);
-    } catch (error) {
-      await fs.rm(temporary, {force: true}).catch(() => undefined);
-      throw error;
-    }
-  })();
-}
-
-function materializeJsonValue(
-  value: unknown,
-  keyPath: string[],
-  event: SseEvent,
-  request: StreamRequest,
-  runtime: RequestRuntime,
-  payloads: MaterializedPayload[],
-): unknown {
-  if (typeof value === 'string') {
-    const candidate = parseBase64Candidate(value);
-    if (!candidate) {
-      if (value.length <= MAX_INLINE_EVENT_DATA_CHARS) {
-        return value;
-      }
-      return {
-        $largeText: true,
-        chars: value.length,
-        sha256: createHash('sha256').update(value, 'utf8').digest('hex'),
-        sourceArtifactId: request.artifacts.find(
-          file => file.kind === 'raw_text',
-        )?.artifactId,
-      };
-    }
-
-    const payloadIndex = runtime.payloadIndex++;
-    const pointer = `/${keyPath.map(item => item.replaceAll('~', '~0').replaceAll('/', '~1')).join('/')}`;
-    const pointerHash = createHash('sha256')
-      .update(pointer, 'utf8')
-      .digest('hex')
-      .slice(0, 12);
-    const relativePath = path.join(
-      request.relativeDir,
-      'payloads',
-      `payload-${String(payloadIndex).padStart(6, '0')}-${pointerHash}.${candidate.extension}`,
-    );
-    const capture = runtime.capture;
-    const artifact = createArtifact(
-      capture,
-      'payload',
-      relativePath,
-      `request-${request.requestIndex + 1}-payload-${payloadIndex}`,
-    );
-    artifact.mimeType = candidate.mimeType;
-    artifact.bytes = candidate.bytes.length;
-    artifact.sha256 = createHash('sha256')
-      .update(candidate.bytes)
-      .digest('hex');
-    const absolutePath = path.join(
-      runtime.absoluteDir,
-      'payloads',
-      path.basename(relativePath),
-    );
-    const descriptor: Record<string, unknown> = {
-      $artifact: artifact,
-      encoding: 'base64',
-      encodedChars: value.length,
-      decodedBytes: candidate.bytes.length,
-      detectionConfidence: candidate.confidence,
-      jsonPointerSha256: pointerHash,
-    };
-    payloads.push({descriptor, artifact, absolutePath, bytes: candidate.bytes});
-    return descriptor;
-  }
-  if (Array.isArray(value)) {
-    return value.map((item, index) =>
-      materializeJsonValue(
-        item,
-        [...keyPath, String(index)],
-        event,
-        request,
-        runtime,
-        payloads,
-      ),
-    );
-  }
-  if (value && typeof value === 'object') {
-    return Object.fromEntries(
-      Object.entries(value).map(([key, item]) => [
-        key,
-        materializeJsonValue(
-          item,
-          [...keyPath, key],
-          event,
-          request,
-          runtime,
-          payloads,
-        ),
-      ]),
-    );
-  }
-  return value;
-}
-
-function materializeEvent(
-  event: SseEvent,
-  request: StreamRequest,
-  runtime: RequestRuntime,
-): MaterializedEvent {
-  const payloads: MaterializedPayload[] = [];
-  const record: Record<string, unknown> = {
-    index: event.index,
-    recordType: event.recordType,
-    eventName: event.eventName,
-    eventId: event.eventId,
-    retry: event.retry,
-    comments: event.comments,
-    done: event.done,
-    source: event.source,
-    timestamp: event.timestamp,
-    dataLength: event.data.length,
-  };
-  if (event.recordType === 'event') {
-    try {
-      const parsed = JSON.parse(event.data) as unknown;
-      record.dataType = 'json';
-      record.dataJson = materializeJsonValue(
-        parsed,
-        ['data'],
-        event,
-        request,
-        runtime,
-        payloads,
-      );
-    } catch {
-      const materialized = materializeJsonValue(
-        event.data,
-        ['data'],
-        event,
-        request,
-        runtime,
-        payloads,
-      );
-      record.dataType = 'text';
-      if (typeof materialized === 'string') {
-        record.data = materialized;
-      } else {
-        record.dataArtifact = materialized;
-      }
-    }
-  }
-  return {
-    record,
-    payloads,
-    summary: {
-      index: event.index,
-      recordType: event.recordType,
-      eventName: event.eventName,
-      done: event.done,
-      timestamp: event.timestamp,
-      source: event.source,
-      dataLength: event.data.length,
-      payloadCount: payloads.length,
+    descriptor: {
+      artifactId: `stream-${capture.id}-${suffix}`,
+      kind,
+      rootIndex: capture.artifactRootIndex,
+      relativePath: toPortablePath(relativePath),
+      bytes: 0,
+      writeStatus: 'pending',
     },
+    relativeToRequestDir: path.basename(relativePath),
+    hash: createHash('sha256'),
+    criticality,
   };
+}
+
+function severity(status: StreamIntegrityStatus): number {
+  return {complete: 0, 'semantic-only': 1, partial: 2, failed: 3}[status];
 }
 
 export class StreamCollector {
   #context: BrowserContext;
   #sessionProvider: CdpSessionProvider;
   #limits: StreamCollectorLimits;
+  #resolveNetworkRequestId?: (
+    page: Page,
+    cdpRequestId: string,
+  ) => number | undefined;
   #captures = new Map<number, StreamCapture>();
   #captureRuntime = new WeakMap<StreamCapture, CaptureRuntime>();
   #activeCaptureByPage = new WeakMap<Page, StreamCapture>();
@@ -711,18 +863,43 @@ export class StreamCollector {
   constructor(
     context: BrowserContext,
     sessionProvider: CdpSessionProvider,
-    limits: Partial<StreamCollectorLimits> = {},
+    options: Partial<StreamCollectorLimits> & {
+      resolveNetworkRequestId?: (
+        page: Page,
+        cdpRequestId: string,
+      ) => number | undefined;
+    } = {},
   ) {
     this.#context = context;
     this.#sessionProvider = sessionProvider;
+    this.#resolveNetworkRequestId = options.resolveNetworkRequestId;
     this.#limits = {
-      maxCaptures: limits.maxCaptures ?? MAX_RETAINED_STREAM_CAPTURES,
+      maxCaptures: options.maxCaptures ?? MAX_RETAINED_STREAM_CAPTURES,
       maxDiskBytesPerCapture:
-        limits.maxDiskBytesPerCapture ?? DEFAULT_STREAM_DISK_QUOTA_BYTES,
+        options.maxDiskBytesPerCapture ?? DEFAULT_STREAM_DISK_QUOTA_BYTES,
+      activationTimeoutMs:
+        options.activationTimeoutMs ?? DEFAULT_STREAM_ACTIVATION_TIMEOUT_MS,
+      maxPendingBytesPerRequest:
+        options.maxPendingBytesPerRequest ?? DEFAULT_STREAM_PENDING_MAX_BYTES,
+      maxSseEventBytes:
+        options.maxSseEventBytes ?? DEFAULT_STREAM_MAX_SSE_EVENT_BYTES,
+      maxIncompleteTailBytes:
+        options.maxIncompleteTailBytes ?? DEFAULT_STREAM_MAX_SSE_EVENT_BYTES,
       maxRecentChunksPerRequest:
-        limits.maxRecentChunksPerRequest ?? MAX_RECENT_STREAM_CHUNKS,
+        options.maxRecentChunksPerRequest ?? MAX_RECENT_STREAM_CHUNKS,
       maxRecentEventsPerRequest:
-        limits.maxRecentEventsPerRequest ?? MAX_RECENT_STREAM_EVENTS,
+        options.maxRecentEventsPerRequest ?? MAX_RECENT_STREAM_EVENTS,
+      maxRequestsPerCapture:
+        options.maxRequestsPerCapture ?? DEFAULT_MAX_REQUESTS,
+      maxArtifactsPerCapture:
+        options.maxArtifactsPerCapture ?? DEFAULT_MAX_ARTIFACTS,
+      maxPayloadsPerRequest:
+        options.maxPayloadsPerRequest ?? DEFAULT_MAX_PAYLOADS,
+      maxEventsPerRequest: options.maxEventsPerRequest ?? DEFAULT_MAX_EVENTS,
+      maxMetadataBytes:
+        options.maxMetadataBytes ?? DEFAULT_STREAM_MAX_METADATA_BYTES,
+      shutdownTimeoutMs:
+        options.shutdownTimeoutMs ?? DEFAULT_SHUTDOWN_TIMEOUT_MS,
     };
   }
 
@@ -815,19 +992,39 @@ export class StreamCollector {
 
   async #setupCdpListeners(page: Page): Promise<void> {
     const client = await this.#sessionProvider.getSession(page);
-    const metadataMap = this.#requestMetadata.get(page);
-    const ownerMap = this.#requestOwners.get(page);
-    if (!metadataMap || !ownerMap) {
-      return;
-    }
+    const metadataMap = this.#requestMetadata.get(page)!;
+    const ownerMap = this.#requestOwners.get(page)!;
 
     const onRequestWillBeSent = (
       event: Protocol.Network.RequestWillBeSentEvent,
     ): void => {
+      const previous = metadataMap.get(event.requestId);
+      const redirects = previous?.redirects ?? [];
+      if (event.redirectResponse) {
+        redirects.push({
+          url: event.redirectResponse.url,
+          status: event.redirectResponse.status,
+          statusText: event.redirectResponse.statusText,
+          headers: event.redirectResponse.headers,
+        });
+      }
       metadataMap.set(event.requestId, {
+        cdpRequestId: event.requestId,
         url: event.request.url,
         method: event.request.method,
         resourceType: event.type,
+        headers: event.request.headers,
+        postData: event.request.postData,
+        hasPostData: event.request.hasPostData,
+        initiator: event.initiator,
+        redirects,
+        startedMonotonicTimeSeconds: event.timestamp,
+        startedWallTimeMs: Number.isFinite(event.wallTime)
+          ? event.wallTime * 1000
+          : undefined,
+        monotonicToWallOffsetMs: Number.isFinite(event.wallTime)
+          ? event.wallTime * 1000 - event.timestamp * 1000
+          : undefined,
       });
     };
 
@@ -839,9 +1036,13 @@ export class StreamCollector {
         return;
       }
       const metadata = metadataMap.get(event.requestId) ?? {
+        cdpRequestId: event.requestId,
         url: event.response.url,
         method: 'GET',
         resourceType: event.type,
+        headers: {},
+        redirects: [],
+        startedMonotonicTimeSeconds: event.timestamp,
       };
       metadata.resourceType ??= event.type;
       if (!matchesFilter(capture.filter, metadata, event.response.mimeType)) {
@@ -850,12 +1051,33 @@ export class StreamCollector {
       if (ownerMap.has(event.requestId)) {
         return;
       }
+      if (capture.requests.length >= this.#limits.maxRequestsPerCapture) {
+        this.#failCaptureLimit(
+          capture,
+          'request_limit',
+          this.#limits.maxRequestsPerCapture,
+          'Stream capture exceeded maxRequestsPerCapture.',
+        );
+        return;
+      }
+      if (
+        this.#artifactCount(capture) + BASE_REQUEST_ARTIFACT_COUNT >
+        this.#limits.maxArtifactsPerCapture
+      ) {
+        this.#failCaptureLimit(
+          capture,
+          'artifact_limit',
+          this.#limits.maxArtifactsPerCapture,
+          'Stream capture exceeded maxArtifactsPerCapture before creating a request.',
+        );
+        return;
+      }
       const request = this.#createRequest(
         capture,
+        page,
+        client,
         metadata,
-        event.requestId,
-        event.response.mimeType,
-        event.timestamp * 1000,
+        event,
       );
       ownerMap.set(event.requestId, request);
       capture.requests.push(request);
@@ -863,10 +1085,9 @@ export class StreamCollector {
       capture.version++;
       const runtime = this.#requestRuntime.get(request)!;
       runtime.activationPromise = this.#activateRequest(
-        client,
         request,
         runtime,
-        event.timestamp * 1000,
+        event.timestamp,
       );
     };
 
@@ -874,24 +1095,48 @@ export class StreamCollector {
       event: Protocol.Network.DataReceivedEvent,
     ): void => {
       const request = ownerMap.get(event.requestId);
-      if (!request) {
+      const runtime = request ? this.#requestRuntime.get(request) : undefined;
+      if (!request || !runtime || runtime.finalized) {
         return;
       }
-      const runtime = this.#requestRuntime.get(request);
-      if (!runtime) {
-        return;
-      }
+      const payload = event.data
+        ? Buffer.from(event.data, 'base64')
+        : Buffer.alloc(0);
       const chunk: PendingChunk = {
-        timestamp: event.timestamp * 1000,
+        monotonicTimeSeconds: event.timestamp,
+        wallTimeMs: wallTimeFromMonotonic(
+          event.timestamp,
+          runtime.metadata.monotonicToWallOffsetMs,
+        ),
         dataLength: event.dataLength,
         encodedDataLength: event.encodedDataLength,
-        payload: event.data
-          ? Buffer.from(event.data, 'base64')
-          : Buffer.alloc(0),
+        payload,
         source: 'network',
       };
-      if (!runtime.activationResolved) {
+      if (!runtime.activationSettled) {
+        if (
+          runtime.pendingBytes + payload.length >
+          this.#limits.maxPendingBytesPerRequest
+        ) {
+          this.#failPendingLimit(request, runtime, payload.length);
+          return;
+        }
         runtime.pendingChunks.push(chunk);
+        runtime.pendingBytes += payload.length;
+        request.pendingBytesPeak = Math.max(
+          request.pendingBytesPeak,
+          runtime.pendingBytes,
+        );
+        return;
+      }
+      if (!runtime.activationSucceeded) {
+        this.#recordDroppedChunk(
+          request,
+          runtime,
+          payload.length,
+          'pending_buffer_limit',
+          this.#limits.maxPendingBytesPerRequest,
+        );
         return;
       }
       this.#processChunk(request, runtime, chunk);
@@ -902,7 +1147,7 @@ export class StreamCollector {
     ): void => {
       const request = ownerMap.get(event.requestId);
       const runtime = request ? this.#requestRuntime.get(request) : undefined;
-      if (!request || !runtime) {
+      if (!request || !runtime || runtime.finalized) {
         return;
       }
       const semanticEvent: SseEvent = {
@@ -914,7 +1159,12 @@ export class StreamCollector {
         comments: [],
         done: event.data.trim() === '[DONE]',
         source: 'eventsource',
-        timestamp: event.timestamp * 1000,
+        invalidUtf8: false,
+        completedMonotonicTimeSeconds: event.timestamp,
+        completedWallTimeMs: wallTimeFromMonotonic(
+          event.timestamp,
+          runtime.metadata.monotonicToWallOffsetMs,
+        ),
       };
       this.#enqueueEventWrite(request, runtime, semanticEvent, 'semantic');
     };
@@ -924,12 +1174,19 @@ export class StreamCollector {
     ): void => {
       metadataMap.delete(event.requestId);
       const request = ownerMap.get(event.requestId);
-      if (!request) {
+      const runtime = request ? this.#requestRuntime.get(request) : undefined;
+      if (!request || !runtime) {
         return;
       }
-      this.#setTerminal(request, {
+      this.#setTerminal(request, runtime, {
         status: 'finished',
-        endedAt: event.timestamp * 1000,
+        reason: 'completed',
+        endedMonotonicTimeSeconds: event.timestamp,
+        endedWallTimeMs:
+          wallTimeFromMonotonic(
+            event.timestamp,
+            runtime.metadata.monotonicToWallOffsetMs,
+          ) ?? Date.now(),
       });
     };
 
@@ -938,18 +1195,28 @@ export class StreamCollector {
     ): void => {
       metadataMap.delete(event.requestId);
       const request = ownerMap.get(event.requestId);
-      if (!request) {
+      const runtime = request ? this.#requestRuntime.get(request) : undefined;
+      if (!request || !runtime) {
         return;
       }
-      this.#setTerminal(request, {
-        status: 'failed',
-        endedAt: event.timestamp * 1000,
-        failure: {
-          errorText: event.errorText,
-          canceled: Boolean(event.canceled),
-          blockedReason: event.blockedReason,
-          code: 'STREAM_ERROR',
-        },
+      const canceled = Boolean(event.canceled);
+      this.#setTerminal(request, runtime, {
+        status: canceled ? 'canceled' : 'failed',
+        reason: canceled ? 'user_cancel' : 'network_error',
+        endedMonotonicTimeSeconds: event.timestamp,
+        endedWallTimeMs:
+          wallTimeFromMonotonic(
+            event.timestamp,
+            runtime.metadata.monotonicToWallOffsetMs,
+          ) ?? Date.now(),
+        failure: canceled
+          ? undefined
+          : {
+              errorText: bounded(event.errorText) ?? 'Network error',
+              canceled: false,
+              blockedReason: bounded(event.blockedReason, 256),
+              code: 'NETWORK_ERROR',
+            },
       });
     };
 
@@ -1011,10 +1278,10 @@ export class StreamCollector {
 
   #createRequest(
     capture: StreamCapture,
+    page: Page,
+    client: Awaited<ReturnType<CdpSessionProvider['getSession']>>,
     metadata: RequestMetadata,
-    requestId: string,
-    mimeType: string,
-    startedAt: number,
+    responseEvent: Protocol.Network.ResponseReceivedEvent,
   ): StreamRequest {
     const captureRuntime = this.#captureRuntime.get(capture)!;
     const requestIndex = capture.requests.length;
@@ -1022,16 +1289,24 @@ export class StreamCollector {
     const relativeDir = toPortablePath(
       path.join(capture.relativeDir, requestDirName),
     );
-    const absoluteDir = path.join(captureRuntime.absoluteDir, requestDirName);
+    const absoluteDir = path.join(
+      captureRuntime.location.absoluteDir,
+      requestDirName,
+    );
     const request: StreamRequest = {
-      requestId,
+      cdpRequestId: metadata.cdpRequestId,
       requestIndex,
-      url: metadata.url,
+      url: bounded(metadata.url, 8192) ?? metadata.url,
       method: metadata.method,
       resourceType: metadata.resourceType,
-      mimeType,
+      mimeType: responseEvent.response.mimeType,
+      responseStatus: responseEvent.response.status,
+      responseStatusText: bounded(responseEvent.response.statusText, 512),
       status: 'activating',
-      startedAt,
+      integrityStatus: 'failed',
+      parseStatus: 'complete',
+      startedMonotonicTimeSeconds: metadata.startedMonotonicTimeSeconds,
+      startedWallTimeMs: metadata.startedWallTimeMs,
       streamResourceContentEnabled: false,
       relativeDir,
       chunkCount: 0,
@@ -1040,38 +1315,61 @@ export class StreamCollector {
       semanticEventCount: 0,
       primaryEventSource: 'none',
       doneMarkerObserved: false,
-      parseErrors: 0,
-      incompleteTailChars: 0,
+      invalidUtf8Count: 0,
+      incompleteTailBytes: 0,
       rawBytes: 0,
       diskBytesReserved: 0,
+      pendingBytesPeak: 0,
       writeErrors: [],
       artifacts: [],
       recentRawEvents: [],
       recentSemanticEvents: [],
     };
-    const artifacts = this.#createRequestArtifacts(
-      capture,
-      request,
-      absoluteDir,
-    );
+    const artifacts = this.#createRequestArtifacts(capture, request);
     request.artifacts.push(
       ...[...artifacts.values()].map(item => item.descriptor),
     );
     const runtime: RequestRuntime = {
       capture,
+      page,
+      client,
+      metadata,
       absoluteDir,
-      decoder: new TextDecoder('utf-8'),
-      parser: new IncrementalSseParser(),
+      initializationPromise: Promise.resolve(),
+      snapshotPromise: Promise.resolve(),
+      parser: new BoundedSseParser(
+        this.#limits.maxSseEventBytes,
+        this.#limits.maxIncompleteTailBytes,
+      ),
+      textDecoder: new TextDecoder('utf-8'),
       rawOffset: 0,
       payloadIndex: 1,
+      payloadCount: 0,
       nextSemanticEventIndex: 0,
-      writeChain: this.#initializeRequestFiles(absoluteDir, artifacts, request),
+      scheduledRawEvents: 0,
+      scheduledSemanticEvents: 0,
+      writeChain: Promise.resolve(),
       activationPromise: Promise.resolve(),
-      activationResolved: false,
+      activationAbort: new AbortController(),
+      activationSettled: false,
+      activationSucceeded: false,
       pendingChunks: [],
+      pendingBytes: 0,
       finalized: false,
       artifacts,
     };
+    runtime.initializationPromise = this.#initializeRequestFiles(
+      request,
+      runtime,
+    );
+    runtime.writeChain = runtime.initializationPromise;
+    const snapshotPromise = this.#writeNetworkSnapshot(
+      request,
+      runtime,
+      responseEvent,
+    );
+    void snapshotPromise.catch(() => undefined);
+    runtime.snapshotPromise = snapshotPromise;
     this.#requestRuntime.set(request, runtime);
     return request;
   }
@@ -1079,78 +1377,205 @@ export class StreamCollector {
   #createRequestArtifacts(
     capture: StreamCapture,
     request: StreamRequest,
-    absoluteDir: string,
   ): Map<StreamArtifactFile['kind'], ArtifactRuntime> {
-    const result = new Map<StreamArtifactFile['kind'], ArtifactRuntime>();
-    const definitions: Array<[StreamArtifactFile['kind'], string, string]> = [
-      ['request_metadata', 'metadata.json', 'metadata'],
-      ['raw_bytes', 'raw.bin', 'raw'],
-      ['raw_text', 'raw.sse', 'text'],
-      ['chunks', 'chunks.jsonl', 'chunks'],
-      ['events', 'events.jsonl', 'events'],
-      ['eventsource_events', 'eventsource.jsonl', 'eventsource'],
+    const definitions: Array<
+      [
+        StreamArtifactFile['kind'],
+        string,
+        string,
+        ArtifactRuntime['criticality'],
+      ]
+    > = [
+      ['request_metadata', 'metadata.json', 'metadata', 'critical'],
+      ['raw_bytes', 'raw.bin', 'raw', 'critical'],
+      ['raw_text', 'raw.sse', 'text', 'supporting'],
+      ['chunks', 'chunks.jsonl', 'chunks', 'critical'],
+      ['events', 'events.jsonl', 'events', 'supporting'],
+      ['eventsource_events', 'eventsource.jsonl', 'eventsource', 'supporting'],
+      [
+        'request_headers',
+        'request-headers.json',
+        'request-headers',
+        'supporting',
+      ],
+      ['request_body', 'request-body.bin', 'request-body', 'supporting'],
+      [
+        'response_headers',
+        'response-headers.json',
+        'response-headers',
+        'supporting',
+      ],
+      ['initiator', 'initiator.json', 'initiator', 'supporting'],
+      ['redirects', 'redirects.json', 'redirects', 'supporting'],
     ];
-    for (const [kind, filename, suffix] of definitions) {
-      const descriptor = createArtifact(
-        capture,
+    return new Map(
+      definitions.map(([kind, filename, suffix, criticality]) => [
         kind,
-        path.join(request.relativeDir, filename),
-        `request-${request.requestIndex + 1}-${suffix}`,
-      );
-      result.set(kind, {
-        descriptor,
-        absolutePath: path.join(absoluteDir, filename),
-        hash: createHash('sha256'),
-      });
-    }
-    return result;
+        createArtifact(
+          capture,
+          kind,
+          path.join(request.relativeDir, filename),
+          `request-${request.requestIndex + 1}-${suffix}`,
+          criticality,
+        ),
+      ]),
+    );
   }
 
   async #initializeRequestFiles(
-    absoluteDir: string,
-    artifacts: Map<StreamArtifactFile['kind'], ArtifactRuntime>,
     request: StreamRequest,
+    runtime: RequestRuntime,
   ): Promise<void> {
+    const captureRuntime = this.#captureRuntime.get(runtime.capture)!;
     try {
-      await fs.mkdir(absoluteDir, {mode: 0o700});
-      await fs.mkdir(path.join(absoluteDir, 'payloads'), {mode: 0o700});
-      for (const artifact of artifacts.values()) {
+      runtime.absoluteDir = await createSecureSubdirectory(
+        captureRuntime.location.rootPath,
+        captureRuntime.location.absoluteDir,
+        path.basename(runtime.absoluteDir),
+      );
+      await createSecureSubdirectory(
+        captureRuntime.location.rootPath,
+        runtime.absoluteDir,
+        'payloads',
+      );
+      for (const artifact of runtime.artifacts.values()) {
         if (artifact.descriptor.kind === 'request_metadata') {
           continue;
         }
-        await fs.writeFile(artifact.absolutePath, Buffer.alloc(0), {
-          flag: 'wx',
-          mode: 0o600,
-        });
+        const opened = await openSecureArtifactFile(
+          captureRuntime.location.rootPath,
+          runtime.absoluteDir,
+          artifact.relativeToRequestDir,
+          fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL,
+        );
+        artifact.handle = opened.handle;
         artifact.descriptor.writeStatus = 'written';
         artifact.descriptor.sha256 = artifact.hash.copy().digest('hex');
       }
     } catch (error) {
-      request.writeErrors.push(getErrorText(error));
-      for (const artifact of artifacts.values()) {
-        if (artifact.descriptor.writeStatus === 'pending') {
-          artifact.descriptor.writeStatus = 'failed';
-          artifact.descriptor.error = getErrorText(error);
-        }
-      }
+      this.#markCoreArtifactFailure(request, runtime, error);
+      throw error;
     }
   }
 
-  async #activateRequest(
-    client: Awaited<ReturnType<CdpSessionProvider['getSession']>>,
+  async #writeNetworkSnapshot(
     request: StreamRequest,
     runtime: RequestRuntime,
-    timestamp: number,
+    responseEvent: Protocol.Network.ResponseReceivedEvent,
   ): Promise<void> {
+    await runtime.initializationPromise;
+    let postData = runtime.metadata.postData;
+    if (!postData && runtime.metadata.hasPostData) {
+      try {
+        const result = await runtime.client.send('Network.getRequestPostData', {
+          requestId: request.cdpRequestId,
+        });
+        postData = result.postData;
+      } catch (error) {
+        request.writeErrors.push(
+          bounded(
+            `Could not obtain request post data: ${getErrorText(error)}`,
+          ) ?? 'Could not obtain request post data.',
+        );
+        request.integrityStatus = 'partial';
+      }
+    }
+    await Promise.all([
+      this.#writeArtifactOnce(
+        request,
+        runtime,
+        'request_headers',
+        Buffer.from(
+          `${JSON.stringify(runtime.metadata.headers, null, 2)}\n`,
+          'utf8',
+        ),
+      ),
+      this.#writeArtifactOnce(
+        request,
+        runtime,
+        'request_body',
+        Buffer.from(postData ?? '', 'utf8'),
+      ),
+      this.#writeArtifactOnce(
+        request,
+        runtime,
+        'response_headers',
+        Buffer.from(
+          `${JSON.stringify(
+            {
+              status: responseEvent.response.status,
+              statusText: responseEvent.response.statusText,
+              headers: responseEvent.response.headers,
+            },
+            null,
+            2,
+          )}\n`,
+          'utf8',
+        ),
+      ),
+      this.#writeArtifactOnce(
+        request,
+        runtime,
+        'initiator',
+        Buffer.from(
+          `${JSON.stringify(runtime.metadata.initiator ?? null, null, 2)}\n`,
+          'utf8',
+        ),
+      ),
+      this.#writeArtifactOnce(
+        request,
+        runtime,
+        'redirects',
+        Buffer.from(
+          `${JSON.stringify(runtime.metadata.redirects, null, 2)}\n`,
+          'utf8',
+        ),
+      ),
+    ]);
+  }
+
+  async #activateRequest(
+    request: StreamRequest,
+    runtime: RequestRuntime,
+    responseMonotonicTimeSeconds: number,
+  ): Promise<void> {
+    const cdpPromise = runtime.client.send('Network.streamResourceContent', {
+      requestId: request.cdpRequestId,
+    });
+    void cdpPromise.catch(() => undefined);
+    let timeout: ReturnType<typeof setTimeout> | undefined;
+    const timeoutPromise = new Promise<never>((_, reject) => {
+      timeout = setTimeout(() => {
+        reject(new Error('streamResourceContent activation timed out'));
+      }, this.#limits.activationTimeoutMs);
+    });
+    const abortPromise = new Promise<never>((_, reject) => {
+      if (runtime.activationAbort.signal.aborted) {
+        reject(runtime.activationAbort.signal.reason);
+        return;
+      }
+      runtime.activationAbort.signal.addEventListener(
+        'abort',
+        () => reject(runtime.activationAbort.signal.reason),
+        {once: true},
+      );
+    });
     try {
-      const result = await client.send('Network.streamResourceContent', {
-        requestId: request.requestId,
-      });
+      const result = await Promise.race([
+        cdpPromise,
+        timeoutPromise,
+        abortPromise,
+      ]);
       request.streamResourceContentEnabled = true;
+      runtime.activationSucceeded = true;
       if (result.bufferedData) {
         const payload = Buffer.from(result.bufferedData, 'base64');
         this.#processChunk(request, runtime, {
-          timestamp,
+          monotonicTimeSeconds: responseMonotonicTimeSeconds,
+          wallTimeMs: wallTimeFromMonotonic(
+            responseMonotonicTimeSeconds,
+            runtime.metadata.monotonicToWallOffsetMs,
+          ),
           dataLength: payload.length,
           encodedDataLength: 0,
           payload,
@@ -1158,91 +1583,91 @@ export class StreamCollector {
         });
       }
     } catch (error) {
-      request.streamResourceContentError = getErrorText(error);
-    } finally {
-      runtime.activationResolved = true;
-      request.status =
-        request.status === 'activating' ? 'streaming' : request.status;
+      const reason =
+        runtime.activationFailureReason ??
+        (getErrorText(error).includes('timed out')
+          ? 'activation_timeout'
+          : 'activation_error');
+      runtime.activationFailureReason = reason;
+      request.streamResourceContentError = bounded(getErrorText(error));
+      request.integrityStatus = 'failed';
+      request.terminalReason ??= reason;
+      if (reason === 'activation_timeout') {
+        request.failure = {
+          errorText: 'streamResourceContent activation timed out.',
+          canceled: false,
+          code: 'ACTIVATION_TIMEOUT',
+        };
+      } else if (reason === 'pending_limit') {
+        request.failure = {
+          errorText:
+            'Pending stream data exceeded the activation buffer limit.',
+          canceled: false,
+          code: 'PENDING_BUFFER_LIMIT',
+        };
+      } else {
+        request.failure = {
+          errorText: bounded(getErrorText(error)) ?? 'Activation failed',
+          canceled: false,
+          code: 'ACTIVATION_ERROR',
+        };
+      }
       for (const pending of runtime.pendingChunks) {
-        this.#processChunk(request, runtime, pending);
+        this.#recordDroppedChunk(
+          request,
+          runtime,
+          pending.payload.length,
+          reason === 'pending_limit'
+            ? 'pending_buffer_limit'
+            : 'activation_failure',
+          this.#limits.maxPendingBytesPerRequest,
+        );
       }
       runtime.pendingChunks.length = 0;
+      runtime.pendingBytes = 0;
+    } finally {
+      if (timeout) {
+        clearTimeout(timeout);
+      }
+      runtime.activationSettled = true;
+      if (runtime.activationSucceeded) {
+        request.status =
+          request.status === 'activating' ? 'streaming' : request.status;
+        for (const pending of runtime.pendingChunks) {
+          this.#processChunk(request, runtime, pending);
+        }
+        runtime.pendingChunks.length = 0;
+        runtime.pendingBytes = 0;
+      } else if (
+        request.resourceType?.toLowerCase() !== 'eventsource' &&
+        !runtime.terminal
+      ) {
+        runtime.terminal = {
+          status: 'failed',
+          reason: runtime.activationFailureReason ?? 'activation_error',
+          endedWallTimeMs: Date.now(),
+          failure: request.failure,
+        };
+      }
     }
   }
 
-  #reserveDisk(
+  #failPendingLimit(
     request: StreamRequest,
     runtime: RequestRuntime,
-    bytes: number,
-    reason: string,
-    options: {droppedChunk?: boolean; droppedBytes?: number} = {},
-  ): boolean {
-    const capture = runtime.capture;
-    if (capture.diskBytesReserved + bytes <= capture.quotaBytes) {
-      capture.diskBytesReserved += bytes;
-      request.diskBytesReserved += bytes;
-      return true;
-    }
-    const now = Date.now();
-    const truncation = capture.truncation ?? {
-      truncatedAt: now,
-      reason: 'disk_quota_exceeded' as const,
-      quotaBytes: capture.quotaBytes,
-      droppedChunkCount: 0,
-      droppedBytes: 0,
-    };
-    capture.truncation = truncation;
-    request.truncation ??= {
-      ...truncation,
-      droppedChunkCount: 0,
-      droppedBytes: 0,
-    };
-    const droppedBytes = options.droppedBytes ?? bytes;
-    capture.truncation.droppedBytes += droppedBytes;
-    request.truncation.droppedBytes += droppedBytes;
-    if (options.droppedChunk) {
-      capture.truncation.droppedChunkCount++;
-      request.truncation.droppedChunkCount++;
-    }
-    capture.status = 'failed';
-    request.status = 'failed';
-    request.failure = {
-      errorText: `Stream capture disk quota exceeded while writing ${reason}`,
-      canceled: false,
-      code: 'DISK_QUOTA_EXCEEDED',
-    };
-    const page = this.#captureRuntime.get(capture)?.page;
-    if (page && this.#activeCaptureByPage.get(page) === capture) {
-      this.#activeCaptureByPage.delete(page);
-    }
-    return false;
-  }
-
-  #recordDroppedChunk(
-    request: StreamRequest,
-    runtime: RequestRuntime,
-    payloadBytes: number,
+    droppedBytes: number,
   ): void {
-    const capture = runtime.capture;
-    const now = Date.now();
-    capture.truncation ??= {
-      truncatedAt: now,
-      reason: 'disk_quota_exceeded',
-      quotaBytes: capture.quotaBytes,
-      droppedChunkCount: 0,
-      droppedBytes: 0,
-    };
-    request.truncation ??= {
-      truncatedAt: now,
-      reason: 'disk_quota_exceeded',
-      quotaBytes: capture.quotaBytes,
-      droppedChunkCount: 0,
-      droppedBytes: 0,
-    };
-    capture.truncation.droppedChunkCount++;
-    capture.truncation.droppedBytes += payloadBytes;
-    request.truncation.droppedChunkCount++;
-    request.truncation.droppedBytes += payloadBytes;
+    runtime.activationFailureReason = 'pending_limit';
+    this.#recordDroppedChunk(
+      request,
+      runtime,
+      droppedBytes,
+      'pending_buffer_limit',
+      this.#limits.maxPendingBytesPerRequest,
+    );
+    runtime.activationAbort.abort(
+      new Error('Pending stream buffer exceeded configured limit'),
+    );
   }
 
   #processChunk(
@@ -1250,39 +1675,50 @@ export class StreamCollector {
     runtime: RequestRuntime,
     pending: PendingChunk,
   ): void {
-    if (runtime.finalized) {
+    if (
+      runtime.finalized ||
+      (request.integrityStatus === 'failed' &&
+        request.failure?.code === 'DISK_QUOTA_EXCEEDED')
+    ) {
       return;
     }
-    if (runtime.capture.status === 'failed' && runtime.capture.truncation) {
-      this.#recordDroppedChunk(request, runtime, pending.payload.length);
-      return;
+    const chunkIndex = request.chunkCount;
+    const events = runtime.parser.push(pending.payload, {
+      chunkIndex,
+      rawByteStart: runtime.rawOffset,
+      monotonicTimeSeconds: pending.monotonicTimeSeconds,
+      wallTimeMs: pending.wallTimeMs,
+    });
+    if (runtime.parser.degradedReason) {
+      request.parseStatus = 'degraded';
+      request.parseDegradedReason = bounded(runtime.parser.degradedReason);
+      request.integrityStatus =
+        request.integrityStatus === 'failed' ? 'failed' : 'partial';
     }
-
-    const decodedText = runtime.decoder.decode(pending.payload, {stream: true});
-    const parsedEvents = runtime.parser.push(decodedText, pending.timestamp);
     const chunk: StreamChunkOffset = {
-      index: request.chunkCount,
-      timestamp: pending.timestamp,
+      index: chunkIndex,
+      monotonicTimeSeconds: pending.monotonicTimeSeconds,
+      wallTimeMs: pending.wallTimeMs,
       dataLength: pending.dataLength,
       encodedDataLength: pending.encodedDataLength,
       payloadBytes: pending.payload.length,
       source: pending.source,
       fileOffsetStart: runtime.rawOffset,
       fileOffsetEnd: runtime.rawOffset + pending.payload.length,
-      eventIndexes: parsedEvents.map(event => event.index),
+      eventIndexes: events.map(event => event.index),
     };
+    const rawText = runtime.textDecoder.decode(pending.payload, {stream: true});
     const chunkLine = toJsonLine(chunk);
-    const textBytes = Buffer.byteLength(decodedText, 'utf8');
-    const requiredBytes = pending.payload.length + textBytes + chunkLine.length;
+    const required =
+      pending.payload.length + Buffer.byteLength(rawText) + chunkLine.length;
     if (
-      !this.#reserveDisk(request, runtime, requiredBytes, 'stream chunk', {
+      !this.#reserveDisk(request, runtime, required, 'stream chunk', {
         droppedChunk: true,
         droppedBytes: pending.payload.length,
       })
     ) {
       return;
     }
-
     runtime.rawOffset += pending.payload.length;
     request.rawBytes += pending.payload.length;
     request.chunkCount++;
@@ -1296,16 +1732,21 @@ export class StreamCollector {
     runtime.capture.totalRawBytes += pending.payload.length;
     runtime.capture.chunkCount++;
     runtime.capture.version++;
-
     this.#queueArtifactAppend(request, runtime, 'raw_bytes', pending.payload);
     this.#queueArtifactAppend(
       request,
       runtime,
       'raw_text',
-      Buffer.from(decodedText, 'utf8'),
+      Buffer.from(rawText, 'utf8'),
     );
     this.#queueArtifactAppend(request, runtime, 'chunks', chunkLine);
-    for (const event of parsedEvents) {
+    for (const event of events) {
+      if (event.invalidUtf8) {
+        request.invalidUtf8Count++;
+        request.parseStatus = 'degraded';
+        request.parseDegradedReason ??=
+          'Invalid UTF-8 was replaced while parsing SSE.';
+      }
       this.#enqueueEventWrite(request, runtime, event, 'raw');
     }
   }
@@ -1320,25 +1761,56 @@ export class StreamCollector {
       return;
     }
     const artifact = runtime.artifacts.get(kind);
-    if (!artifact) {
-      request.writeErrors.push(`Missing ${kind} artifact`);
-      return;
-    }
     runtime.writeChain = runtime.writeChain.then(async () => {
+      if (!artifact?.handle) {
+        this.#markArtifactFailure(
+          request,
+          runtime,
+          artifact,
+          new Error(`Artifact ${kind} was not initialized.`),
+        );
+        return;
+      }
       try {
-        await fs.appendFile(artifact.absolutePath, data);
+        await artifact.handle.write(data);
         artifact.hash.update(data);
         artifact.descriptor.bytes += data.length;
         artifact.descriptor.sha256 = artifact.hash.copy().digest('hex');
         artifact.descriptor.writeStatus = 'written';
       } catch (error) {
-        artifact.descriptor.writeStatus = 'failed';
-        artifact.descriptor.error = getErrorText(error);
-        request.writeErrors.push(
-          `Could not append ${kind}: ${getErrorText(error)}`,
-        );
+        this.#markArtifactFailure(request, runtime, artifact, error);
       }
     });
+  }
+
+  async #writeArtifactOnce(
+    request: StreamRequest,
+    runtime: RequestRuntime,
+    kind: StreamArtifactFile['kind'],
+    data: Buffer,
+  ): Promise<void> {
+    if (!this.#reserveDisk(request, runtime, data.length, kind)) {
+      return;
+    }
+    const artifact = runtime.artifacts.get(kind);
+    if (!artifact?.handle) {
+      this.#markArtifactFailure(
+        request,
+        runtime,
+        artifact,
+        new Error(`Artifact ${kind} was not initialized.`),
+      );
+      return;
+    }
+    try {
+      await artifact.handle.write(data);
+      artifact.hash.update(data);
+      artifact.descriptor.bytes += data.length;
+      artifact.descriptor.sha256 = artifact.hash.copy().digest('hex');
+      artifact.descriptor.writeStatus = 'written';
+    } catch (error) {
+      this.#markArtifactFailure(request, runtime, artifact, error);
+    }
   }
 
   #enqueueEventWrite(
@@ -1347,16 +1819,32 @@ export class StreamCollector {
     event: SseEvent,
     destination: 'raw' | 'semantic',
   ): void {
-    const materialized = materializeEvent(event, request, runtime);
-    const targetKind: StreamArtifactFile['kind'] =
-      destination === 'raw' ? 'events' : 'eventsource_events';
-    const targetArtifact = runtime.artifacts.get(targetKind);
-    if (!targetArtifact) {
-      request.writeErrors.push(`Missing ${targetKind} artifact`);
+    const currentCount =
+      destination === 'raw'
+        ? runtime.scheduledRawEvents
+        : runtime.scheduledSemanticEvents;
+    if (currentCount >= this.#limits.maxEventsPerRequest) {
+      request.parseStatus = 'raw-only';
+      request.parseDegradedReason = 'Event count exceeded configured limit.';
+      request.integrityStatus = 'partial';
+      request.truncation ??= {
+        truncatedWallTimeMs: Date.now(),
+        reason: 'event_limit',
+        limit: this.#limits.maxEventsPerRequest,
+        droppedChunkCount: 0,
+        droppedBytes: 0,
+      };
       return;
     }
-    const estimatedRecordBytes =
-      Buffer.byteLength(JSON.stringify(materialized.record), 'utf8') + 1;
+    if (destination === 'raw') {
+      runtime.scheduledRawEvents++;
+    } else {
+      runtime.scheduledSemanticEvents++;
+    }
+    const materialized = this.#materializeEvent(event, request, runtime);
+    const targetKind: StreamArtifactFile['kind'] =
+      destination === 'raw' ? 'events' : 'eventsource_events';
+    const lineEstimate = toJsonLine(materialized.record);
     const payloadBytes = materialized.payloads.reduce(
       (sum, payload) => sum + payload.bytes.length,
       0,
@@ -1365,50 +1853,66 @@ export class StreamCollector {
       !this.#reserveDisk(
         request,
         runtime,
-        estimatedRecordBytes + payloadBytes,
+        lineEstimate.length + payloadBytes,
         'SSE event',
       )
     ) {
       return;
     }
-
     runtime.writeChain = runtime.writeChain.then(async () => {
       for (const payload of materialized.payloads) {
         request.artifacts.push(payload.artifact);
         try {
-          await fs.writeFile(payload.absolutePath, payload.bytes, {
-            flag: 'wx',
-            mode: 0o600,
-          });
+          const captureRuntime = this.#captureRuntime.get(runtime.capture)!;
+          const opened = await openSecureArtifactFile(
+            captureRuntime.location.rootPath,
+            runtime.absoluteDir,
+            payload.relativeToRequestDir,
+            fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL,
+          );
+          try {
+            await opened.handle.writeFile(payload.bytes);
+            await opened.handle.sync();
+          } finally {
+            await opened.handle.close();
+          }
           payload.artifact.bytes = payload.bytes.length;
           payload.artifact.sha256 = createHash('sha256')
             .update(payload.bytes)
             .digest('hex');
           payload.artifact.writeStatus = 'written';
-          const descriptor = materialized.record;
-          void descriptor;
         } catch (error) {
           payload.artifact.writeStatus = 'failed';
-          payload.artifact.error = getErrorText(error);
+          payload.artifact.error = bounded(getErrorText(error));
           request.writeErrors.push(
-            `Could not write payload ${payload.artifact.relativePath}: ${getErrorText(error)}`,
+            bounded(
+              `Could not write payload ${payload.artifact.relativePath}: ${getErrorText(error)}`,
+            ) ?? 'Could not write payload.',
           );
+          request.integrityStatus = 'partial';
         }
       }
-
+      const target = runtime.artifacts.get(targetKind);
+      if (!target?.handle) {
+        this.#markArtifactFailure(
+          request,
+          runtime,
+          target,
+          new Error(`Artifact ${targetKind} was not initialized.`),
+        );
+        return;
+      }
       try {
         const line = toJsonLine(materialized.record);
-        await fs.appendFile(targetArtifact.absolutePath, line);
-        targetArtifact.hash.update(line);
-        targetArtifact.descriptor.bytes += line.length;
-        targetArtifact.descriptor.sha256 = targetArtifact.hash
-          .copy()
-          .digest('hex');
-        targetArtifact.descriptor.writeStatus = 'written';
+        await target.handle.write(line);
+        target.hash.update(line);
+        target.descriptor.bytes += line.length;
+        target.descriptor.sha256 = target.hash.copy().digest('hex');
+        target.descriptor.writeStatus = 'written';
         if (destination === 'raw') {
           request.rawEventCount++;
-          request.primaryEventSource = 'raw-stream';
           runtime.capture.rawEventCount++;
+          request.primaryEventSource = 'raw-stream';
           request.recentRawEvents.push(materialized.summary);
           this.#trimRecent(request.recentRawEvents);
         } else {
@@ -1422,24 +1926,212 @@ export class StreamCollector {
         }
         request.doneMarkerObserved ||= event.done;
       } catch (error) {
-        targetArtifact.descriptor.writeStatus = 'failed';
-        targetArtifact.descriptor.error = getErrorText(error);
-        request.writeErrors.push(
-          `Could not write ${targetKind}: ${getErrorText(error)}`,
-        );
+        this.#markArtifactFailure(request, runtime, target, error);
       }
     });
   }
 
-  #trimRecent(events: StreamEventSummary[]): void {
-    if (events.length > this.#limits.maxRecentEventsPerRequest) {
-      events.splice(0, events.length - this.#limits.maxRecentEventsPerRequest);
+  #materializeEvent(
+    event: SseEvent,
+    request: StreamRequest,
+    runtime: RequestRuntime,
+  ): MaterializedEvent {
+    const payloads: MaterializedPayload[] = [];
+    const record: Record<string, unknown> = {
+      index: event.index,
+      recordType: event.recordType,
+      eventName: event.eventName,
+      eventId: event.eventId,
+      retry: event.retry,
+      comments: event.comments,
+      done: event.done,
+      source: event.source,
+      invalidUtf8: event.invalidUtf8,
+      dataLength: event.data.length,
+      rawByteStart: event.rawByteStart,
+      rawByteEnd: event.rawByteEnd,
+      decodedCharStart: event.decodedCharStart,
+      decodedCharEnd: event.decodedCharEnd,
+      firstChunkIndex: event.firstChunkIndex,
+      lastChunkIndex: event.lastChunkIndex,
+      firstByteMonotonicTimeSeconds: event.firstByteMonotonicTimeSeconds,
+      firstByteWallTimeMs: event.firstByteWallTimeMs,
+      completedMonotonicTimeSeconds: event.completedMonotonicTimeSeconds,
+      completedWallTimeMs: event.completedWallTimeMs,
+    };
+    if (event.recordType === 'event') {
+      try {
+        record.dataType = 'json';
+        record.dataJson = this.#materializeJsonValue(
+          JSON.parse(event.data) as unknown,
+          ['data'],
+          request,
+          runtime,
+          payloads,
+        );
+      } catch {
+        record.dataType = 'text';
+        const value = this.#materializeJsonValue(
+          event.data,
+          ['data'],
+          request,
+          runtime,
+          payloads,
+        );
+        if (typeof value === 'string') {
+          record.data = value;
+        } else {
+          record.dataArtifact = value;
+        }
+      }
     }
+    return {
+      record,
+      payloads,
+      summary: {
+        index: event.index,
+        recordType: event.recordType,
+        eventName: event.eventName,
+        done: event.done,
+        source: event.source,
+        dataLength: event.data.length,
+        payloadCount: payloads.length,
+        rawByteStart: event.rawByteStart,
+        rawByteEnd: event.rawByteEnd,
+        completedWallTimeMs: event.completedWallTimeMs,
+      },
+    };
   }
 
-  #setTerminal(request: StreamRequest, terminal: RequestTerminal): void {
-    const runtime = this.#requestRuntime.get(request);
-    if (!runtime || runtime.finalized) {
+  #materializeJsonValue(
+    value: unknown,
+    keyPath: string[],
+    request: StreamRequest,
+    runtime: RequestRuntime,
+    payloads: MaterializedPayload[],
+  ): unknown {
+    if (typeof value === 'string') {
+      const candidate = parseBase64Candidate(value);
+      if (!candidate) {
+        if (value.length <= MAX_INLINE_EVENT_DATA_CHARS) {
+          return value;
+        }
+        return {
+          $largeText: true,
+          chars: value.length,
+          sha256: createHash('sha256').update(value, 'utf8').digest('hex'),
+          sourceArtifactId: request.artifacts.find(
+            file => file.kind === 'raw_text',
+          )?.artifactId,
+        };
+      }
+      if (runtime.payloadCount >= this.#limits.maxPayloadsPerRequest) {
+        request.integrityStatus = 'partial';
+        request.truncation ??= {
+          truncatedWallTimeMs: Date.now(),
+          reason: 'payload_limit',
+          limit: this.#limits.maxPayloadsPerRequest,
+          droppedChunkCount: 0,
+          droppedBytes: candidate.bytes.length,
+        };
+        return {
+          $payloadOmitted: true,
+          encodedChars: value.length,
+          decodedBytes: candidate.bytes.length,
+          sha256: createHash('sha256').update(candidate.bytes).digest('hex'),
+          reason: 'payload_limit',
+        };
+      }
+      if (
+        this.#artifactCount(runtime.capture) >=
+        this.#limits.maxArtifactsPerCapture
+      ) {
+        request.integrityStatus = 'partial';
+        request.truncation ??= {
+          truncatedWallTimeMs: Date.now(),
+          reason: 'artifact_limit',
+          limit: this.#limits.maxArtifactsPerCapture,
+          droppedChunkCount: 0,
+          droppedBytes: candidate.bytes.length,
+        };
+        return {
+          $payloadOmitted: true,
+          encodedChars: value.length,
+          decodedBytes: candidate.bytes.length,
+          sha256: createHash('sha256').update(candidate.bytes).digest('hex'),
+          reason: 'artifact_limit',
+        };
+      }
+      const payloadIndex = runtime.payloadIndex++;
+      runtime.payloadCount++;
+      const pointer = `/${keyPath
+        .map(item => item.replaceAll('~', '~0').replaceAll('/', '~1'))
+        .join('/')}`;
+      const pointerHash = createHash('sha256')
+        .update(pointer)
+        .digest('hex')
+        .slice(0, 12);
+      const filename = `payload-${String(payloadIndex).padStart(6, '0')}-${pointerHash}.${candidate.extension}`;
+      const artifact: StreamArtifactFile = {
+        artifactId: `stream-${runtime.capture.id}-request-${request.requestIndex + 1}-payload-${payloadIndex}`,
+        kind: 'payload',
+        rootIndex: runtime.capture.artifactRootIndex,
+        relativePath: toPortablePath(
+          path.join(request.relativeDir, 'payloads', filename),
+        ),
+        bytes: candidate.bytes.length,
+        sha256: createHash('sha256').update(candidate.bytes).digest('hex'),
+        mimeType: candidate.mimeType,
+        writeStatus: 'pending',
+      };
+      payloads.push({
+        artifact,
+        relativeToRequestDir: path.join('payloads', filename),
+        bytes: candidate.bytes,
+      });
+      return {
+        $artifact: artifact,
+        encoding: 'base64',
+        encodedChars: value.length,
+        decodedBytes: candidate.bytes.length,
+        detectionConfidence: candidate.confidence,
+        jsonPointerSha256: pointerHash,
+      };
+    }
+    if (Array.isArray(value)) {
+      return value.map((item, index) =>
+        this.#materializeJsonValue(
+          item,
+          [...keyPath, String(index)],
+          request,
+          runtime,
+          payloads,
+        ),
+      );
+    }
+    if (value && typeof value === 'object') {
+      return Object.fromEntries(
+        Object.entries(value).map(([key, item]) => [
+          key,
+          this.#materializeJsonValue(
+            item,
+            [...keyPath, key],
+            request,
+            runtime,
+            payloads,
+          ),
+        ]),
+      );
+    }
+    return value;
+  }
+
+  #setTerminal(
+    request: StreamRequest,
+    runtime: RequestRuntime,
+    terminal: RequestTerminal,
+  ): void {
+    if (runtime.finalized) {
       return;
     }
     runtime.terminal ??= terminal;
@@ -1458,58 +2150,165 @@ export class StreamCollector {
     runtime.finalizePromise = (async () => {
       try {
         await runtime.activationPromise;
-        if (!runtime.finalized) {
-          const finalText = runtime.decoder.decode();
-          const finalEvents = runtime.parser.push(
-            finalText,
-            runtime.terminal?.endedAt,
+        await runtime.snapshotPromise.catch(error => {
+          request.writeErrors.push(
+            bounded(`Network snapshot failed: ${getErrorText(error)}`) ??
+              'Network snapshot failed.',
           );
-          request.incompleteTailChars = runtime.parser.incompleteTail.length;
-          if (finalText.length > 0) {
-            const bytes = Buffer.from(finalText, 'utf8');
-            if (
-              this.#reserveDisk(
-                request,
-                runtime,
-                bytes.length,
-                'final UTF-8 decoder output',
-              )
-            ) {
-              this.#queueArtifactAppend(request, runtime, 'raw_text', bytes);
-            }
-          }
-          for (const event of finalEvents) {
-            this.#enqueueEventWrite(request, runtime, event, 'raw');
-          }
-          runtime.finalized = true;
-        }
+          request.integrityStatus = 'partial';
+        });
         await runtime.writeChain;
       } catch (error) {
-        request.writeErrors.push(`Finalize error: ${getErrorText(error)}`);
-      }
-
-      const terminal = runtime.terminal;
-      if (request.failure?.code !== 'DISK_QUOTA_EXCEEDED' && terminal) {
-        request.status = terminal.status;
-        request.endedAt = terminal.endedAt;
-        request.failure = terminal.failure;
-      } else if (!request.endedAt) {
-        request.endedAt = terminal?.endedAt ?? Date.now();
-      }
-
-      try {
-        await this.#writeRequestMetadata(request, runtime);
-      } catch (error) {
         request.writeErrors.push(
-          `Could not write final request metadata: ${getErrorText(error)}`,
-        );
-        await this.#writeRequestMetadata(request, runtime).catch(
-          () => undefined,
+          bounded(`Finalize error: ${getErrorText(error)}`) ??
+            'Finalize error.',
         );
       }
+      const finalText = runtime.textDecoder.decode();
+      if (finalText.length > 0) {
+        const finalTextBytes = Buffer.from(finalText, 'utf8');
+        if (
+          this.#reserveDisk(
+            request,
+            runtime,
+            finalTextBytes.length,
+            'final UTF-8 decoder output',
+          )
+        ) {
+          this.#queueArtifactAppend(
+            request,
+            runtime,
+            'raw_text',
+            finalTextBytes,
+          );
+          await runtime.writeChain;
+        }
+      }
+      request.incompleteTailBytes = runtime.parser.incompleteTailBytes;
+      if (runtime.parser.degradedReason) {
+        request.parseStatus = 'degraded';
+        request.parseDegradedReason = bounded(runtime.parser.degradedReason);
+      }
+      const terminal = runtime.terminal ?? {
+        status: 'failed' as const,
+        reason: runtime.activationFailureReason ?? 'activation_error',
+        endedWallTimeMs: Date.now(),
+        failure: request.failure,
+      };
+      request.status = terminal.status;
+      request.terminalReason = terminal.reason;
+      request.endedMonotonicTimeSeconds = terminal.endedMonotonicTimeSeconds;
+      request.endedWallTimeMs = terminal.endedWallTimeMs;
+      if (terminal.failure) {
+        request.failure = terminal.failure;
+      }
+      request.networkRequestId = this.#resolveNetworkRequestId?.(
+        runtime.page,
+        request.cdpRequestId,
+      );
+      await this.#closeRequestHandles(runtime);
+      runtime.finalized = true;
+      this.#recomputeRequestIntegrity(request, runtime);
+      await this.#writeRequestMetadata(request, runtime);
+      this.#recomputeCaptureIntegrity(runtime.capture);
       await this.#queueCaptureMetadata(runtime.capture);
     })();
     await runtime.finalizePromise;
+  }
+
+  async #closeRequestHandles(runtime: RequestRuntime): Promise<void> {
+    for (const artifact of runtime.artifacts.values()) {
+      if (!artifact.handle) {
+        continue;
+      }
+      try {
+        await artifact.handle.sync();
+      } catch {
+        // Write status is already tracked by the append path.
+      }
+      await artifact.handle.close().catch(() => undefined);
+      artifact.handle = undefined;
+    }
+  }
+
+  #recomputeRequestIntegrity(
+    request: StreamRequest,
+    runtime: RequestRuntime,
+  ): void {
+    if (!runtime.activationSucceeded) {
+      if (
+        request.resourceType?.toLowerCase() === 'eventsource' &&
+        request.semanticEventCount > 0
+      ) {
+        request.integrityStatus = 'semantic-only';
+        request.primaryEventSource = 'eventsource';
+        request.parseStatus = 'raw-only';
+      } else {
+        request.integrityStatus = 'failed';
+        request.status = 'failed';
+        request.terminalReason =
+          runtime.activationFailureReason ?? 'activation_error';
+      }
+      return;
+    }
+    const criticalFailed = request.artifacts.some(
+      artifact =>
+        artifact.writeStatus === 'failed' &&
+        ['raw_bytes', 'chunks', 'request_metadata'].includes(artifact.kind),
+    );
+    const supportingFailed = request.artifacts.some(
+      artifact => artifact.writeStatus === 'failed',
+    );
+    if (request.failure?.code === 'DISK_QUOTA_EXCEEDED') {
+      request.integrityStatus = 'failed';
+      request.status = 'failed';
+      request.terminalReason = 'quota';
+      return;
+    }
+    if (criticalFailed || request.failure?.code === 'ARTIFACT_ERROR') {
+      request.integrityStatus = 'failed';
+      request.status = 'failed';
+      request.terminalReason = 'artifact_error';
+      return;
+    }
+    if (
+      supportingFailed ||
+      request.parseStatus !== 'complete' ||
+      request.truncation ||
+      request.writeErrors.length > 0
+    ) {
+      request.integrityStatus = 'partial';
+      return;
+    }
+    request.integrityStatus = 'complete';
+  }
+
+  #recomputeCaptureIntegrity(capture: StreamCapture): void {
+    if (
+      capture.truncation &&
+      ['disk_quota_exceeded', 'request_limit', 'artifact_limit'].includes(
+        capture.truncation.reason,
+      )
+    ) {
+      capture.integrityStatus = 'failed';
+      capture.status = 'failed';
+      return;
+    }
+    if (capture.requests.length === 0) {
+      capture.integrityStatus =
+        capture.status === 'failed' ? 'failed' : 'partial';
+      return;
+    }
+    capture.integrityStatus = capture.requests.reduce<StreamIntegrityStatus>(
+      (current, request) =>
+        severity(request.integrityStatus) > severity(current)
+          ? request.integrityStatus
+          : current,
+      'complete',
+    );
+    if (capture.integrityStatus === 'failed') {
+      capture.status = 'failed';
+    }
   }
 
   async #writeRequestMetadata(
@@ -1520,35 +2319,84 @@ export class StreamCollector {
     if (!artifact) {
       return;
     }
-    const content = Buffer.from(
+    let content = Buffer.from(
       `${JSON.stringify(this.#requestManifest(request), null, 2)}\n`,
       'utf8',
     );
+    if (content.length > this.#limits.maxMetadataBytes) {
+      request.integrityStatus = 'partial';
+      request.truncation ??= {
+        truncatedWallTimeMs: Date.now(),
+        reason: 'metadata_limit',
+        limit: this.#limits.maxMetadataBytes,
+        droppedChunkCount: 0,
+        droppedBytes: content.length - this.#limits.maxMetadataBytes,
+      };
+      content = Buffer.from(
+        `${JSON.stringify(
+          {
+            request: this.#requestSummaryForManifest(request),
+            metadataTruncated: true,
+            metadataLimit: this.#limits.maxMetadataBytes,
+            errors: request.writeErrors,
+          },
+          null,
+          2,
+        )}\n`,
+        'utf8',
+      );
+    }
+    const delta = Math.max(0, content.length - artifact.descriptor.bytes);
+    if (!this.#reserveDisk(request, runtime, delta, 'request metadata')) {
+      return;
+    }
+    const captureRuntime = this.#captureRuntime.get(runtime.capture)!;
     try {
-      await atomicWriteFile(artifact.absolutePath, content);
+      await writeSecureAtomicArtifactFile(
+        captureRuntime.location.rootPath,
+        runtime.absoluteDir,
+        artifact.relativeToRequestDir,
+        content,
+      );
       artifact.descriptor.bytes = content.length;
       artifact.descriptor.sha256 = createHash('sha256')
         .update(content)
         .digest('hex');
       artifact.descriptor.writeStatus = 'written';
     } catch (error) {
-      artifact.descriptor.writeStatus = 'failed';
-      artifact.descriptor.error = getErrorText(error);
-      throw error;
+      this.#markArtifactFailure(request, runtime, artifact, error);
     }
   }
 
   #requestManifest(request: StreamRequest): Record<string, unknown> {
     return {
-      requestId: request.requestId,
+      ...this.#requestSummaryForManifest(request),
+      artifacts: request.artifacts,
+      recentChunks: request.recentChunks,
+      writeErrors: request.writeErrors,
+    };
+  }
+
+  #requestSummaryForManifest(request: StreamRequest): Record<string, unknown> {
+    return {
+      cdpRequestId: request.cdpRequestId,
+      networkRequestId: request.networkRequestId,
       requestIndex: request.requestIndex,
       url: request.url,
       method: request.method,
       resourceType: request.resourceType,
       mimeType: request.mimeType,
+      responseStatus: request.responseStatus,
+      responseStatusText: request.responseStatusText,
       status: request.status,
-      startedAt: request.startedAt,
-      endedAt: request.endedAt,
+      terminalReason: request.terminalReason,
+      integrityStatus: request.integrityStatus,
+      parseStatus: request.parseStatus,
+      parseDegradedReason: request.parseDegradedReason,
+      startedMonotonicTimeSeconds: request.startedMonotonicTimeSeconds,
+      startedWallTimeMs: request.startedWallTimeMs,
+      endedMonotonicTimeSeconds: request.endedMonotonicTimeSeconds,
+      endedWallTimeMs: request.endedWallTimeMs,
       failure: request.failure,
       streamResourceContentEnabled: request.streamResourceContentEnabled,
       streamResourceContentError: request.streamResourceContentError,
@@ -1558,13 +2406,12 @@ export class StreamCollector {
       semanticEventCount: request.semanticEventCount,
       primaryEventSource: request.primaryEventSource,
       doneMarkerObserved: request.doneMarkerObserved,
-      parseErrors: request.parseErrors,
-      incompleteTailChars: request.incompleteTailChars,
+      invalidUtf8Count: request.invalidUtf8Count,
+      incompleteTailBytes: request.incompleteTailBytes,
       rawBytes: request.rawBytes,
       diskBytesReserved: request.diskBytesReserved,
+      pendingBytesPeak: request.pendingBytesPeak,
       truncation: request.truncation,
-      artifacts: request.artifacts,
-      writeErrors: request.writeErrors,
     };
   }
 
@@ -1572,17 +2419,18 @@ export class StreamCollector {
     return {
       captureId: capture.id,
       status: capture.status,
+      integrityStatus: capture.integrityStatus,
       filter: capture.filter,
       artifactRootIndex: capture.artifactRootIndex,
       relativeDir: capture.relativeDir,
+      metadataArtifact: capture.metadataArtifact,
       pageUrl: capture.pageUrl,
       pageTitle: capture.pageTitle,
-      createdAt: capture.createdAt,
-      stoppedAt: capture.stoppedAt,
+      createdWallTimeMs: capture.createdWallTimeMs,
+      stoppedWallTimeMs: capture.stoppedWallTimeMs,
       requestCount: capture.requests.length,
       totalRawBytes: capture.totalRawBytes,
       diskBytesReserved: capture.diskBytesReserved,
-      metadataArtifact: capture.metadataArtifact,
       chunkCount: capture.chunkCount,
       rawEventCount: capture.rawEventCount,
       semanticEventCount: capture.semanticEventCount,
@@ -1590,24 +2438,7 @@ export class StreamCollector {
       truncation: capture.truncation,
       errors: capture.errors,
       requests: capture.requests.map(request => ({
-        requestId: request.requestId,
-        requestIndex: request.requestIndex,
-        url: request.url,
-        method: request.method,
-        resourceType: request.resourceType,
-        mimeType: request.mimeType,
-        status: request.status,
-        relativeDir: request.relativeDir,
-        chunkCount: request.chunkCount,
-        rawEventCount: request.rawEventCount,
-        semanticEventCount: request.semanticEventCount,
-        primaryEventSource: request.primaryEventSource,
-        doneMarkerObserved: request.doneMarkerObserved,
-        rawBytes: request.rawBytes,
-        truncation: request.truncation,
-        metadataArtifactId: request.artifacts.find(
-          artifact => artifact.kind === 'request_metadata',
-        )?.artifactId,
+        ...this.#requestSummaryForManifest(request),
         artifacts: request.artifacts,
       })),
     };
@@ -1619,12 +2450,59 @@ export class StreamCollector {
       return Promise.resolve();
     }
     runtime.metadataChain = runtime.metadataChain.then(async () => {
-      const content = Buffer.from(
+      let content = Buffer.from(
         `${JSON.stringify(this.#captureManifest(capture), null, 2)}\n`,
         'utf8',
       );
+      if (content.length > this.#limits.maxMetadataBytes) {
+        capture.integrityStatus = 'partial';
+        capture.truncation ??= {
+          truncatedWallTimeMs: Date.now(),
+          reason: 'metadata_limit',
+          limit: this.#limits.maxMetadataBytes,
+          droppedChunkCount: 0,
+          droppedBytes: content.length - this.#limits.maxMetadataBytes,
+        };
+        content = Buffer.from(
+          `${JSON.stringify(
+            {
+              captureId: capture.id,
+              status: capture.status,
+              integrityStatus: capture.integrityStatus,
+              relativeDir: capture.relativeDir,
+              metadataTruncated: true,
+              metadataLimit: this.#limits.maxMetadataBytes,
+              requestMetadataArtifacts: capture.requests.map(request =>
+                request.artifacts.find(
+                  artifact => artifact.kind === 'request_metadata',
+                ),
+              ),
+              errors: capture.errors,
+            },
+            null,
+            2,
+          )}\n`,
+          'utf8',
+        );
+      }
+      const delta = Math.max(
+        0,
+        content.length - capture.metadataArtifact.bytes,
+      );
+      if (capture.diskBytesReserved + delta > capture.quotaBytes) {
+        capture.status = 'failed';
+        capture.integrityStatus = 'failed';
+        capture.errors.push('Capture metadata exceeded disk quota.');
+        return;
+      }
+      capture.diskBytesReserved += delta;
       try {
-        await atomicWriteFile(runtime.metadataAbsolutePath, content);
+        await writeSecureAtomicArtifactFile(
+          runtime.location.rootPath,
+          runtime.location.absoluteDir,
+          'capture.json',
+          content,
+        );
         capture.metadataArtifact.bytes = content.length;
         capture.metadataArtifact.sha256 = createHash('sha256')
           .update(content)
@@ -1632,13 +2510,187 @@ export class StreamCollector {
         capture.metadataArtifact.writeStatus = 'written';
       } catch (error) {
         capture.metadataArtifact.writeStatus = 'failed';
-        capture.metadataArtifact.error = getErrorText(error);
+        capture.metadataArtifact.error = bounded(getErrorText(error));
+        capture.status = 'failed';
+        capture.integrityStatus = 'failed';
         capture.errors.push(
-          `Could not update capture metadata: ${getErrorText(error)}`,
+          bounded(
+            `Could not atomically update capture metadata: ${getErrorText(error)}`,
+          ) ?? 'Could not atomically update capture metadata.',
         );
       }
     });
     return runtime.metadataChain;
+  }
+
+  #reserveDisk(
+    request: StreamRequest,
+    runtime: RequestRuntime,
+    bytes: number,
+    reason: string,
+    options: {droppedChunk?: boolean; droppedBytes?: number} = {},
+  ): boolean {
+    if (bytes <= 0) {
+      return true;
+    }
+    const capture = runtime.capture;
+    if (capture.diskBytesReserved + bytes <= capture.quotaBytes) {
+      capture.diskBytesReserved += bytes;
+      request.diskBytesReserved += bytes;
+      return true;
+    }
+    capture.status = 'failed';
+    capture.integrityStatus = 'failed';
+    request.integrityStatus = 'failed';
+    request.status = 'failed';
+    request.terminalReason = 'quota';
+    request.failure = {
+      errorText: `Stream capture disk quota exceeded while writing ${reason}.`,
+      canceled: false,
+      code: 'DISK_QUOTA_EXCEEDED',
+    };
+    const truncation = {
+      truncatedWallTimeMs: Date.now(),
+      reason: 'disk_quota_exceeded' as const,
+      limit: capture.quotaBytes,
+      droppedChunkCount: options.droppedChunk ? 1 : 0,
+      droppedBytes: options.droppedBytes ?? bytes,
+    };
+    capture.truncation ??= {...truncation};
+    request.truncation ??= {...truncation};
+    return false;
+  }
+
+  #recordDroppedChunk(
+    request: StreamRequest,
+    runtime: RequestRuntime,
+    payloadBytes: number,
+    reason: StreamTruncation['reason'],
+    limit: number,
+  ): void {
+    const now = Date.now();
+    runtime.capture.truncation ??= {
+      truncatedWallTimeMs: now,
+      reason,
+      limit,
+      droppedChunkCount: 0,
+      droppedBytes: 0,
+    };
+    request.truncation ??= {
+      truncatedWallTimeMs: now,
+      reason,
+      limit,
+      droppedChunkCount: 0,
+      droppedBytes: 0,
+    };
+    runtime.capture.truncation.droppedChunkCount++;
+    runtime.capture.truncation.droppedBytes += payloadBytes;
+    request.truncation.droppedChunkCount++;
+    request.truncation.droppedBytes += payloadBytes;
+  }
+
+  #markCoreArtifactFailure(
+    request: StreamRequest,
+    runtime: RequestRuntime,
+    error: unknown,
+  ): void {
+    const message = getErrorText(error);
+    request.writeErrors.push(
+      bounded(`Artifact initialization failed: ${message}`) ??
+        'Artifact initialization failed.',
+    );
+    request.integrityStatus = 'failed';
+    request.status = 'failed';
+    request.terminalReason = 'artifact_error';
+    request.failure = {
+      errorText: bounded(message) ?? 'Artifact initialization failed',
+      canceled: false,
+      code: 'ARTIFACT_ERROR',
+    };
+    for (const artifact of runtime.artifacts.values()) {
+      if (artifact.descriptor.writeStatus === 'pending') {
+        artifact.descriptor.writeStatus = 'failed';
+        artifact.descriptor.error = bounded(message);
+      }
+    }
+    runtime.activationAbort.abort(error);
+    runtime.terminal ??= {
+      status: 'failed',
+      reason: 'artifact_error',
+      endedWallTimeMs: Date.now(),
+      failure: request.failure,
+    };
+  }
+
+  #markArtifactFailure(
+    request: StreamRequest,
+    runtime: RequestRuntime,
+    artifact: ArtifactRuntime | undefined,
+    error: unknown,
+  ): void {
+    const message = getErrorText(error);
+    if (artifact) {
+      artifact.descriptor.writeStatus = 'failed';
+      artifact.descriptor.error = bounded(message);
+    }
+    request.writeErrors.push(bounded(message) ?? 'Artifact operation failed.');
+    if (artifact?.criticality === 'critical') {
+      request.integrityStatus = 'failed';
+      request.failure = {
+        errorText: bounded(message) ?? 'Critical artifact write failed',
+        canceled: false,
+        code: 'ARTIFACT_ERROR',
+      };
+      request.terminalReason = 'artifact_error';
+      runtime.activationAbort.abort(error);
+      runtime.terminal ??= {
+        status: 'failed',
+        reason: 'artifact_error',
+        endedWallTimeMs: Date.now(),
+        failure: request.failure,
+      };
+    } else {
+      request.integrityStatus = 'partial';
+    }
+  }
+
+  #failCaptureLimit(
+    capture: StreamCapture,
+    reason: StreamTruncation['reason'],
+    limit: number,
+    message: string,
+  ): void {
+    capture.status = 'failed';
+    capture.integrityStatus = 'failed';
+    capture.truncation ??= {
+      truncatedWallTimeMs: Date.now(),
+      reason,
+      limit,
+      droppedChunkCount: 0,
+      droppedBytes: 0,
+    };
+    capture.errors.push(bounded(message) ?? 'Capture limit exceeded.');
+    const runtime = this.#captureRuntime.get(capture);
+    if (runtime && this.#activeCaptureByPage.get(runtime.page) === capture) {
+      this.#activeCaptureByPage.delete(runtime.page);
+    }
+    void this.#queueCaptureMetadata(capture);
+  }
+
+  #artifactCount(capture: StreamCapture): number {
+    return (
+      1 +
+      capture.requests.reduce(
+        (sum, request) => sum + request.artifacts.length,
+        0,
+      )
+    );
+  }
+
+  #trimRecent(events: StreamEventSummary[]): void {
+    if (events.length > this.#limits.maxRecentEventsPerRequest) {
+      events.splice(0, events.length - this.#limits.maxRecentEventsPerRequest);
+    }
   }
 
   async startCapture(
@@ -1653,32 +2705,26 @@ export class StreamCollector {
       );
     }
     const id = this.#nextCaptureId++;
+    const relativeDir = toPortablePath(location.relativeDir);
     const metadataArtifact: StreamArtifactFile = {
       artifactId: `stream-${id}-capture-metadata`,
       kind: 'capture_metadata',
       rootIndex: location.rootIndex,
-      relativePath: toPortablePath(
-        path.join(location.relativeDir, 'capture.json'),
-      ),
+      relativePath: toPortablePath(path.join(relativeDir, 'capture.json')),
       bytes: 0,
       writeStatus: 'pending',
     };
     const capture: StreamCapture = {
       id,
       status: 'armed',
-      filter: {
-        ...filter,
-        mimeTypes:
-          filter.mimeTypes?.length === 0
-            ? undefined
-            : (filter.mimeTypes ?? ['text/event-stream']),
-      },
+      integrityStatus: 'partial',
+      filter: normalizeFilter(filter),
       artifactRootIndex: location.rootIndex,
-      relativeDir: toPortablePath(location.relativeDir),
+      relativeDir,
       metadataArtifact,
-      pageUrl: page.url(),
-      pageTitle: await page.title().catch(() => undefined),
-      createdAt: Date.now(),
+      pageUrl: bounded(page.url(), 8192) ?? '',
+      pageTitle: bounded(await page.title().catch(() => undefined), 2048),
+      createdWallTimeMs: Date.now(),
       requests: [],
       totalRawBytes: 0,
       diskBytesReserved: 0,
@@ -1692,8 +2738,7 @@ export class StreamCollector {
     this.#captures.set(id, capture);
     this.#captureRuntime.set(capture, {
       page,
-      absoluteDir: location.absoluteDir,
-      metadataAbsolutePath: path.join(location.absoluteDir, 'capture.json'),
+      location: {...location, relativeDir},
       metadataChain: Promise.resolve(),
     });
     this.#activeCaptureByPage.set(page, capture);
@@ -1701,35 +2746,6 @@ export class StreamCollector {
     await this.#queueCaptureMetadata(capture);
     this.#evictOldCaptures();
     return capture;
-  }
-
-  #evictOldCaptures(): void {
-    if (this.#captures.size <= this.#limits.maxCaptures) {
-      return;
-    }
-    for (const [id, capture] of this.#captures) {
-      const runtime = this.#captureRuntime.get(capture);
-      const active = runtime
-        ? this.#activeCaptureByPage.get(runtime.page) === capture
-        : false;
-      const settled = capture.requests.every(request => {
-        const requestRuntime = this.#requestRuntime.get(request);
-        return (
-          ['finished', 'stopped', 'failed'].includes(request.status) &&
-          requestRuntime?.finalized === true
-        );
-      });
-      if (
-        ['stopped', 'failed'].includes(capture.status) &&
-        settled &&
-        !active
-      ) {
-        this.#captures.delete(id);
-        if (this.#captures.size <= this.#limits.maxCaptures) {
-          break;
-        }
-      }
-    }
   }
 
   getById(captureId: number): StreamCapture {
@@ -1740,33 +2756,52 @@ export class StreamCollector {
     return capture;
   }
 
-  async stopCapture(captureId: number): Promise<StreamCapture> {
+  async stopCapture(
+    captureId: number,
+    reason: StreamTerminalReason = 'collector_stop',
+  ): Promise<StreamCapture> {
     const capture = this.getById(captureId);
     const runtime = this.#captureRuntime.get(capture);
     if (!runtime) {
       return capture;
     }
-    if (!['stopped', 'failed'].includes(capture.status)) {
+    capture.stoppedWallTimeMs ??= Date.now();
+    if (capture.status !== 'failed') {
       capture.status = 'stopped';
-      capture.stoppedAt = Date.now();
-    } else {
-      capture.stoppedAt ??= Date.now();
     }
     if (this.#activeCaptureByPage.get(runtime.page) === capture) {
       this.#activeCaptureByPage.delete(runtime.page);
     }
     for (const request of capture.requests) {
       const requestRuntime = this.#requestRuntime.get(request);
-      if (requestRuntime && !requestRuntime.terminal) {
-        requestRuntime.terminal = {
-          status: 'stopped',
-          endedAt: capture.stoppedAt,
-        };
+      if (!requestRuntime) {
+        continue;
       }
+      if (!requestRuntime.activationSettled && !requestRuntime.terminal) {
+        requestRuntime.activationFailureReason = reason;
+        requestRuntime.activationAbort.abort(
+          new Error(`Stream activation interrupted by ${reason}`),
+        );
+      }
+      requestRuntime.terminal ??= {
+        status: reason === 'shutdown_timeout' ? 'failed' : 'stopped',
+        reason,
+        endedWallTimeMs: capture.stoppedWallTimeMs,
+        failure:
+          reason === 'shutdown_timeout'
+            ? {
+                errorText:
+                  'Shutdown timed out while finalizing stream capture.',
+                canceled: false,
+                code: 'SHUTDOWN_TIMEOUT',
+              }
+            : undefined,
+      };
     }
     await Promise.all(
       capture.requests.map(request => this.#finalizeRequest(request)),
     );
+    this.#recomputeCaptureIntegrity(capture);
     await this.#queueCaptureMetadata(capture);
     return capture;
   }
@@ -1776,24 +2811,26 @@ export class StreamCollector {
       capture => this.#captureRuntime.get(capture)?.page === page,
     );
     for (const capture of captures) {
-      if (!['stopped', 'failed'].includes(capture.status)) {
-        capture.status = 'failed';
-        capture.stoppedAt = Date.now();
-        capture.errors.push('Owning page closed before capture was stopped.');
-      }
+      capture.status = 'failed';
+      capture.stoppedWallTimeMs ??= Date.now();
+      capture.errors.push('Owning page closed before capture was finalized.');
       for (const request of capture.requests) {
         const runtime = this.#requestRuntime.get(request);
-        if (runtime && !runtime.terminal) {
-          runtime.terminal = {
-            status: 'failed',
-            endedAt: capture.stoppedAt ?? Date.now(),
-            failure: {
-              errorText: 'Owning page closed during stream capture.',
-              canceled: false,
-              code: 'PAGE_CLOSED',
-            },
-          };
+        if (!runtime) {
+          continue;
         }
+        runtime.activationFailureReason ??= 'activation_error';
+        runtime.activationAbort.abort(new Error('Owning page closed'));
+        runtime.terminal ??= {
+          status: 'failed',
+          reason: 'page_close',
+          endedWallTimeMs: capture.stoppedWallTimeMs,
+          failure: {
+            errorText: 'Owning page closed during stream capture.',
+            canceled: false,
+            code: 'PAGE_CLOSED',
+          },
+        };
       }
       await Promise.all(
         capture.requests.map(request => this.#finalizeRequest(request)),
@@ -1807,19 +2844,84 @@ export class StreamCollector {
     await this.#pageClosePromises.get(page);
   }
 
-  dispose(): void {
+  async dispose(
+    options: {timeoutMs?: number; reason?: string} = {},
+  ): Promise<void> {
+    if (this.#disposed) {
+      return;
+    }
     this.#disposed = true;
+    const timeoutMs = options.timeoutMs ?? this.#limits.shutdownTimeoutMs;
+    const active = [...this.#captures.values()].filter(
+      capture => !['stopped', 'failed'].includes(capture.status),
+    );
+    let timeout: ReturnType<typeof setTimeout> | undefined;
+    const cleanup = Promise.all(
+      active.map(capture => this.stopCapture(capture.id, 'collector_stop')),
+    ).then(() => false);
+    const timedOut = await Promise.race([
+      cleanup,
+      new Promise<boolean>(resolve => {
+        timeout = setTimeout(() => resolve(true), timeoutMs);
+      }),
+    ]);
+    if (timeout) {
+      clearTimeout(timeout);
+    }
+    if (timedOut) {
+      for (const capture of active) {
+        capture.status = 'failed';
+        capture.integrityStatus = 'failed';
+        capture.stoppedWallTimeMs ??= Date.now();
+        capture.errors.push(
+          bounded(
+            `Stream shutdown finalization timed out after ${timeoutMs}ms: ${options.reason ?? 'shutdown'}`,
+          ) ?? 'Stream shutdown finalization timed out.',
+        );
+        for (const request of capture.requests) {
+          const runtime = this.#requestRuntime.get(request);
+          runtime?.activationAbort.abort(new Error('shutdown timeout'));
+          request.status = 'failed';
+          request.terminalReason = 'shutdown_timeout';
+          request.integrityStatus = 'failed';
+          request.failure = {
+            errorText:
+              'Shutdown timed out before stream finalization completed.',
+            canceled: false,
+            code: 'SHUTDOWN_TIMEOUT',
+          };
+        }
+        await this.#queueCaptureMetadata(capture).catch(() => undefined);
+      }
+    }
     if (this.#listeningForPages) {
       this.#context.off('page', this.#onPageCreated);
       this.#listeningForPages = false;
     }
-    for (const capture of this.#captures.values()) {
-      if (!['stopped', 'failed'].includes(capture.status)) {
-        void this.stopCapture(capture.id).catch(() => undefined);
-      }
-    }
     for (const page of this.#context.pages()) {
       this.#removePageListeners(page);
+    }
+  }
+
+  #evictOldCaptures(): void {
+    if (this.#captures.size <= this.#limits.maxCaptures) {
+      return;
+    }
+    for (const [id, capture] of this.#captures) {
+      const runtime = this.#captureRuntime.get(capture);
+      const active = runtime
+        ? this.#activeCaptureByPage.get(runtime.page) === capture
+        : false;
+      const settled = capture.requests.every(request => {
+        const requestRuntime = this.#requestRuntime.get(request);
+        return requestRuntime?.finalized === true;
+      });
+      if (!active && settled) {
+        this.#captures.delete(id);
+        if (this.#captures.size <= this.#limits.maxCaptures) {
+          break;
+        }
+      }
     }
   }
 

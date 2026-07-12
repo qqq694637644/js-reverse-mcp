@@ -7,6 +7,7 @@
 import assert from 'node:assert/strict';
 import {test} from 'node:test';
 
+import type {StreamCapture} from '../../src/StreamCollector.js';
 import {zod} from '../../src/third_party/index.js';
 import {
   assertSafeStreamToolOutput,
@@ -85,4 +86,81 @@ test('recursive stream output guard rejects overlong strings', () => {
     () => assertSafeStreamToolOutput({value: 'x'.repeat(8193)}),
     /overlong string/i,
   );
+});
+
+test('filter arrays reject empty values', () => {
+  for (const field of ['methods', 'resourceTypes', 'mimeTypes'] as const) {
+    assert.throws(
+      () =>
+        zod.object(startStreamCapture.schema).parse({
+          [field]: [],
+        }),
+      /too_small|at least 1|array/i,
+    );
+  }
+});
+
+test('stop runtime validation returns only capture and request metadata artifacts', async () => {
+  const metadata = {
+    artifactId: 'stream-1-capture-metadata',
+    kind: 'capture_metadata',
+    rootIndex: 0,
+    relativePath: 'captures/one/capture.json',
+    bytes: 10,
+    sha256: 'a'.repeat(64),
+    writeStatus: 'written',
+  } as const;
+  const requestMetadata = {
+    artifactId: 'stream-1-request-1-metadata',
+    kind: 'request_metadata',
+    rootIndex: 0,
+    relativePath: 'captures/one/request-0001/metadata.json',
+    bytes: 10,
+    sha256: 'b'.repeat(64),
+    writeStatus: 'written',
+  } as const;
+  const payload = {
+    artifactId: 'stream-1-request-1-payload-1',
+    kind: 'payload',
+    rootIndex: 0,
+    relativePath: 'captures/one/request-0001/payloads/one.bin',
+    bytes: 20,
+    sha256: 'c'.repeat(64),
+    writeStatus: 'written',
+  } as const;
+  const capture = {
+    id: 1,
+    status: 'stopped',
+    integrityStatus: 'complete',
+    filter: {mimeTypes: ['text/event-stream']},
+    artifactRootIndex: 0,
+    relativeDir: 'captures/one',
+    metadataArtifact: metadata,
+    pageUrl: 'https://example.test',
+    createdWallTimeMs: 1,
+    stoppedWallTimeMs: 2,
+    requests: [{artifacts: [requestMetadata, payload]}],
+    totalRawBytes: 10,
+    diskBytesReserved: 30,
+    chunkCount: 1,
+    rawEventCount: 1,
+    semanticEventCount: 0,
+    quotaBytes: 1000,
+    errors: [],
+    version: 1,
+  } as unknown as StreamCapture;
+  let structured: Record<string, unknown> | undefined;
+  await stopStreamCapture.handler(
+    {params: {captureId: 1}},
+    {
+      appendResponseLine: () => undefined,
+      setStructuredContent: (value: Record<string, unknown>) => {
+        structured = value;
+      },
+    } as never,
+    {stopStreamCapture: async () => capture} as never,
+  );
+  assert.ok(structured);
+  assert.deepEqual(structured.requestMetadataArtifacts, [requestMetadata]);
+  assert.equal(JSON.stringify(structured).includes('payloads/one.bin'), false);
 });

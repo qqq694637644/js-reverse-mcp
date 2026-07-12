@@ -4,7 +4,6 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import {randomUUID} from 'node:crypto';
 import {constants as fsConstants} from 'node:fs';
 import fs from 'node:fs/promises';
 import os from 'node:os';
@@ -15,8 +14,8 @@ import {DebuggerContext} from './DebuggerContext.js';
 import {extractUrlLikeFromDevToolsTitle, urlsEqual} from './DevtoolsUtils.js';
 import type {TrafficSummary} from './formatters/websocketFormatter.js';
 import {
+  allocateSecureArtifactDirectory,
   assertLocalFileWriteAllowed,
-  getAllowedRoots,
 } from './LocalFileAccess.js';
 import {NetworkCollector, ConsoleCollector} from './PageCollector.js';
 import type {ListenerMap, RequestInitiator} from './PageCollector.js';
@@ -85,7 +84,13 @@ export class McpContext implements Context {
   private constructor(
     browserContext: BrowserContext,
     logger: Debugger,
-    options: {streamMaxBytes?: number} = {},
+    options: {
+      streamMaxBytes?: number;
+      streamArtifactRoot?: string;
+      streamActivationTimeoutMs?: number;
+      streamPendingMaxBytes?: number;
+      streamMaxSseEventBytes?: number;
+    } = {},
   ) {
     this.browserContext = browserContext;
     this.sessionProvider = new CdpSessionProvider(browserContext);
@@ -124,9 +129,28 @@ export class McpContext implements Context {
     this.#streamCollector = new StreamCollector(
       this.browserContext,
       this.sessionProvider,
-      {maxDiskBytesPerCapture: options.streamMaxBytes},
+      {
+        maxDiskBytesPerCapture: options.streamMaxBytes,
+        activationTimeoutMs: options.streamActivationTimeoutMs,
+        maxPendingBytesPerRequest: options.streamPendingMaxBytes,
+        maxSseEventBytes: options.streamMaxSseEventBytes,
+        maxIncompleteTailBytes: options.streamMaxSseEventBytes,
+        resolveNetworkRequestId: (page, cdpRequestId) => {
+          const request = this.#networkCollector.find(page, candidate => {
+            return (
+              this.#networkCollector.getCdpRequestId(candidate) === cdpRequestId
+            );
+          });
+          return request
+            ? this.#networkCollector.getIdForResource(request)
+            : undefined;
+        },
+      },
     );
+    this.#streamArtifactRoot = options.streamArtifactRoot;
   }
+
+  #streamArtifactRoot?: string;
 
   #initializedCapabilities = new Set<ToolCapability>();
   #capabilityInitializers = new Map<ToolCapability, Promise<void>>();
@@ -238,12 +262,14 @@ export class McpContext implements Context {
     }
   }
 
-  dispose() {
+  async dispose(
+    options: {timeoutMs?: number; reason?: string} = {},
+  ): Promise<void> {
     this.#networkCollector.dispose();
     this.#consoleCollector.dispose();
     this.#webSocketCollector.dispose();
-    this.#streamCollector.dispose();
-    void this.#debuggerContext.disable();
+    await this.#streamCollector.dispose(options);
+    await this.#debuggerContext.disable();
   }
 
   /**
@@ -291,7 +317,13 @@ export class McpContext implements Context {
   static async from(
     browserContext: BrowserContext,
     logger: Debugger,
-    options: {streamMaxBytes?: number} = {},
+    options: {
+      streamMaxBytes?: number;
+      streamArtifactRoot?: string;
+      streamActivationTimeoutMs?: number;
+      streamPendingMaxBytes?: number;
+      streamMaxSseEventBytes?: number;
+    } = {},
   ) {
     const context = new McpContext(browserContext, logger, options);
     await context.#init();
@@ -377,38 +409,19 @@ export class McpContext implements Context {
   async startStreamCapture(
     filter: StreamCaptureFilter,
   ): Promise<StreamCapture> {
-    const roots = getAllowedRoots();
-    if (!roots?.length) {
-      throw new ToolError(
-        'PERMISSION_DENIED',
-        'Streaming capture requires --allowedRoots so artifacts are written into a shared, bounded workspace.',
-      );
-    }
-    const rootIndex = 0;
-    const relativeDir = path.join(
-      'js-reverse-streams',
-      `capture-${Date.now()}-${randomUUID()}`,
+    const location = await allocateSecureArtifactDirectory(
+      this.#streamArtifactRoot,
+      {parentName: 'js-reverse-streams', prefix: 'capture'},
     );
-    const absoluteDir = path.join(roots[rootIndex], relativeDir);
-    try {
-      await fs.mkdir(path.dirname(absoluteDir), {recursive: true, mode: 0o700});
-      await fs.mkdir(absoluteDir, {mode: 0o700});
-    } catch (error) {
-      throw new ToolError(
-        'IO_ERROR',
-        'Could not allocate a unique streaming capture directory.',
-        {cause: error},
-      );
-    }
     try {
       return await this.#streamCollector.startCapture(
         this.getSelectedPage(),
         filter,
-        {rootIndex, absoluteDir, relativeDir},
+        location,
       );
     } catch (error) {
       await fs
-        .rm(absoluteDir, {recursive: true, force: true})
+        .rm(location.absoluteDir, {recursive: true, force: true})
         .catch(() => undefined);
       throw error;
     }

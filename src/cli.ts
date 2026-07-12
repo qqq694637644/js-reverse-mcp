@@ -6,6 +6,7 @@
 
 import type {YargsOptions} from './third_party/index.js';
 import {yargs, hideBin} from './third_party/index.js';
+import {TOOL_EXPOSURE_MODES} from './toolRegistry.js';
 
 export const cliOptions = {
   browserUrl: {
@@ -54,6 +55,60 @@ export const cliOptions = {
       return value;
     },
   },
+  streamArtifactRoot: {
+    type: 'string',
+    description:
+      'Deployment-controlled allowed-root selector used for stream artifacts. Accepts an allowed-root index such as "0" or an exact configured allowed-root path. Required before stream capture can start.',
+  },
+  streamActivationTimeoutMs: {
+    type: 'number',
+    description:
+      'Internal timeout for Network.streamResourceContent activation. Defaults to 10000ms. Timeout produces a finalized failed or semantic-only manifest instead of leaving a request permanently activating.',
+    default: 10_000,
+    coerce: (value: number) => {
+      if (!Number.isSafeInteger(value) || value <= 0) {
+        throw new Error(
+          'streamActivationTimeoutMs must be a positive safe integer.',
+        );
+      }
+      return value;
+    },
+  },
+  streamPendingMaxBytes: {
+    type: 'number',
+    description:
+      'Maximum in-memory bytes queued while streamResourceContent activation is pending. Defaults to 8388608 (8 MiB). Exceeding it fails activation explicitly.',
+    default: 8 * 1024 * 1024,
+    coerce: (value: number) => {
+      if (!Number.isSafeInteger(value) || value <= 0) {
+        throw new Error(
+          'streamPendingMaxBytes must be a positive safe integer.',
+        );
+      }
+      return value;
+    },
+  },
+  streamMaxSseEventBytes: {
+    type: 'number',
+    description:
+      'Maximum bytes retained by the semantic SSE parser for one event or incomplete tail. Raw capture continues after semantic parsing degrades. Defaults to 8388608 (8 MiB).',
+    default: 8 * 1024 * 1024,
+    coerce: (value: number) => {
+      if (!Number.isSafeInteger(value) || value <= 0) {
+        throw new Error(
+          'streamMaxSseEventBytes must be a positive safe integer.',
+        );
+      }
+      return value;
+    },
+  },
+  toolExposureMode: {
+    type: 'string',
+    choices: TOOL_EXPOSURE_MODES,
+    default: 'mcp',
+    description:
+      'Tool exposure profile. "mcp" exposes stream lifecycle primitives. "gpt-action" hides them from tools/list so a downstream Action can expose only one atomic capture_flow operation.',
+  },
   cloak: {
     type: 'boolean',
     description:
@@ -93,6 +148,14 @@ export function parseArguments(version: string, argv = process.argv) {
       [
         '$0 --allowedRoots /workspace --allowedRoots /tmp/captures',
         'Restrict local-file reads and writes to explicit directories',
+      ],
+      [
+        '$0 --allowedRoots /workspace --streamArtifactRoot 0',
+        'Store stream artifacts under allowed root index 0',
+      ],
+      [
+        '$0 --toolExposureMode gpt-action',
+        'Hide stream lifecycle primitives from tools/list for GPT Action deployment',
       ],
       ['$0 --help', 'Print CLI options'],
     ]);

@@ -14,6 +14,12 @@ import type {Tool} from '@modelcontextprotocol/sdk/types.js';
 const MCP_SERVER_PATH = 'build/src/index.js';
 const CORPUS_PATH = 'evals/tool-routing.json';
 const EXPECTED_TOOL_COUNT = 27;
+const EXPECTED_GPT_ACTION_TOOL_COUNT = 24;
+const STREAM_LIFECYCLE_TOOLS = new Set([
+  'start_stream_capture',
+  'get_stream_status',
+  'stop_stream_capture',
+]);
 const MIN_CASES = 20;
 const MAX_CASES = 40;
 const REQUIRED_CATEGORIES = [
@@ -187,7 +193,9 @@ async function readCorpus(): Promise<RoutingCorpus> {
   };
 }
 
-async function loadMcpMetadata(): Promise<McpMetadata> {
+async function loadMcpMetadata(
+  serverArgs: string[] = [],
+): Promise<McpMetadata> {
   const serverPath = path.resolve(MCP_SERVER_PATH);
   try {
     await fs.access(serverPath);
@@ -199,7 +207,7 @@ async function loadMcpMetadata(): Promise<McpMetadata> {
 
   const transport = new StdioClientTransport({
     command: process.execPath,
-    args: [serverPath],
+    args: [serverPath, ...serverArgs],
     // The transport's default allowlist already prevents eval credentials from
     // reaching the child. Consume stderr without echoing local paths or logs.
     stderr: 'pipe',
@@ -226,6 +234,32 @@ async function loadMcpMetadata(): Promise<McpMetadata> {
     };
   } finally {
     await client.close().catch(() => undefined);
+  }
+}
+
+function validateGptActionExposure(metadata: McpMetadata): void {
+  const errors: string[] = [];
+  if (metadata.tools.length !== EXPECTED_GPT_ACTION_TOOL_COUNT) {
+    errors.push(
+      `GPT Action exposure must contain ${EXPECTED_GPT_ACTION_TOOL_COUNT} tools, got ${metadata.tools.length}.`,
+    );
+  }
+  for (const tool of metadata.tools) {
+    if (STREAM_LIFECYCLE_TOOLS.has(tool.name)) {
+      errors.push(
+        `GPT Action tools/list must not expose stream lifecycle primitive ${tool.name}.`,
+      );
+    }
+  }
+  if (!metadata.instructions.includes('runBrowserExperiment(capture_flow)')) {
+    errors.push(
+      'GPT Action server instructions must direct the downstream backend to atomic runBrowserExperiment(capture_flow).',
+    );
+  }
+  if (errors.length > 0) {
+    throw new Error(
+      `GPT Action exposure validation failed:\n- ${errors.join('\n- ')}`,
+    );
   }
 }
 
@@ -792,13 +826,15 @@ async function main(): Promise<void> {
     throw new Error('Pass exactly one of --validate-only or --live.');
   }
 
-  const [corpus, metadata] = await Promise.all([
+  const [corpus, metadata, gptActionMetadata] = await Promise.all([
     readCorpus(),
     loadMcpMetadata(),
+    loadMcpMetadata(['--toolExposureMode', 'gpt-action']),
   ]);
   validateContract(corpus, metadata);
+  validateGptActionExposure(gptActionMetadata);
   console.log(
-    `Validated ${metadata.tools.length} MCP tools and ${corpus.cases.length} routing cases.`,
+    `Validated ${metadata.tools.length} MCP tools, ${gptActionMetadata.tools.length} GPT Action tools, and ${corpus.cases.length} routing cases.`,
   );
 
   if (validateOnly) {
