@@ -53,6 +53,7 @@ test('status schema defaults to bounded summaries', () => {
   const parsed = zod.object(getStreamStatus.schema).parse({captureId: 1});
   assert.equal(parsed.includeRecentChunks, false);
   assert.equal(parsed.afterEventIndex, -1);
+  assert.equal(parsed.eventSource, undefined);
   assert.equal(parsed.pageIdx, 0);
   assert.equal(parsed.pageSize, 20);
 });
@@ -93,6 +94,7 @@ test('status accepts a controlled event predicate without event body output', as
     version: 52,
   } as unknown as StreamCapture;
   let structured: Record<string, unknown> | undefined;
+  let query: Record<string, unknown> | undefined;
   await getStreamStatus.handler(
     {
       params: {
@@ -101,6 +103,7 @@ test('status accepts a controlled event predicate without event body output', as
         includeRecentChunks: false,
         eventPredicate: {type: 'exact_data', value: 'target'},
         afterEventIndex: 0,
+        eventSource: 'raw-stream',
         pageIdx: 0,
         pageSize: 20,
       },
@@ -113,12 +116,18 @@ test('status accepts a controlled event predicate without event body output', as
     } as never,
     {
       getStreamCapture: () => capture,
-      findStreamEventMatch: async () => ({
-        matched: true,
-        matchedEventIndex: 1,
-        matchedRequestId: 'request-1',
-        matchedSource: 'raw-stream',
-      }),
+      findStreamEventMatch: async (
+        _captureId: number,
+        value: Record<string, unknown>,
+      ) => {
+        query = value;
+        return {
+          matched: true,
+          matchedEventIndex: 1,
+          matchedRequestId: 'request-1',
+          matchedSource: 'raw-stream',
+        };
+      },
     } as never,
   );
   assert.deepEqual(structured?.eventMatch, {
@@ -127,6 +136,7 @@ test('status accepts a controlled event predicate without event body output', as
     matchedRequestId: 'request-1',
     matchedSource: 'raw-stream',
   });
+  assert.equal(query?.eventSource, 'raw-stream');
   const serialized = JSON.stringify(structured);
   assert.equal(serialized.includes('event body'), false);
   assert.equal(serialized.includes('"data":"target"'), false);

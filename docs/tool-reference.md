@@ -124,13 +124,14 @@ content is kept for human-readable compatibility.
 
 ### `get_stream_status`
 
-**Description:** Ordinary MCP primitive that returns bounded status for a global capture ID. Optional eventPredicate plus afterEventIndex matches exact_data, event_name, or json_path_equals against the complete on-disk event sequence and returns only match metadata. It never returns event bodies, credentials, raw bytes, Base64, payload artifacts, or host absolute paths.
+**Description:** Ordinary MCP primitive that returns bounded status for a global capture ID. Optional eventPredicate plus afterEventIndex and eventSource matches exact_data, event_name, or json_path_equals against one complete on-disk event sequence and returns only match metadata. It never returns event bodies, credentials, raw bytes, Base64, payload artifacts, or host absolute paths.
 
 **Parameters:**
 
 - **afterEventIndex** (integer) _(optional)_
 - **captureId** (integer) **(required)**
 - **eventPredicate** (unknown) _(optional)_
+- **eventSource** (enum: "raw-stream", "eventsource") _(optional)_
 - **includeRecentChunks** (boolean) _(optional)_
 - **pageIdx** (integer) _(optional)_
 - **pageSize** (integer) _(optional)_

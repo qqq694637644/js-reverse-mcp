@@ -273,11 +273,11 @@ The CLI stays intentionally small and every flag is optional. Default behavior i
 | `--streamPendingMaxBytes`     | Maximum pending bytes retained in memory before activation completes. Exceeding it fails explicitly.                                                                                                                                                                                                  | `8388608`   |
 | `--streamMaxSseEventBytes`    | Semantic parser limit for one SSE event or incomplete tail. Raw evidence continues when parsing degrades.                                                                                                                                                                                             | `8388608`   |
 
-Streaming capture requires both `--allowedRoots` and `--streamArtifactRoot`. With `web_rev_action`, both local processes must see the same LocalEvidenceStore directory; this is not a GitHub Gateway workspace. MCP returns only an allowed-root index, evidence-root-relative paths, and opaque artifact IDs—not host absolute paths.
+Streaming capture requires both `--allowedRoots` and `--streamArtifactRoot`. With `web_rev_action`, both local processes must see the same analysis workspace directory. MCP returns only an allowed-root index, workspace-relative paths, and opaque artifact IDs—not host absolute paths.
 
 Request snapshots keep ordinary headers, redirect-hop CDP ExtraInfo, UTF-8 `postData`, and explicit completeness metadata separately. They are not wire-level body bytes. `requestSnapshotIntegrity` uses the weakest headers/body dimension and `replayReadiness` is reported separately. Credential artifacts are marked `credential` and have separate redacted header artifacts for default reading.
 
-`get_stream_status` accepts a controlled `eventPredicate` plus `afterEventIndex`. The collector matches `exact_data`, `event_name`, or `json_path_equals` against the full event artifacts and returns only match metadata, never the event body. Page listings also return a stable `pageId` that can be selected after tab indices shift.
+`get_stream_status` accepts a controlled `eventPredicate`, a source-specific `afterEventIndex`, and optional `eventSource=raw-stream|eventsource`. The collector matches `exact_data`, `event_name`, or `json_path_equals` against the selected full event artifact and returns only match metadata, never the event body. Raw and semantic events retain independent indices. Page listings also return a stable `pageId` that can be selected after tab indices shift.
 
 ### Example Configurations
 

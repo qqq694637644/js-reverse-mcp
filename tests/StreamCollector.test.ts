@@ -1496,8 +1496,18 @@ test('capture version advances for semantic events, terminal state, and finalize
       eventId: '1',
       data: '{"type":"semantic"}',
     });
-    await collector.findEventMatch(capture.id, {
+    const semanticMatch = await collector.findEventMatch(capture.id, {
       requestId,
+      eventSource: 'eventsource',
+      predicate: {
+        type: 'json_path_equals',
+        path: '$.type',
+        value: 'semantic',
+      },
+    });
+    const rawMatch = await collector.findEventMatch(capture.id, {
+      requestId,
+      eventSource: 'raw-stream',
       predicate: {
         type: 'json_path_equals',
         path: '$.type',
@@ -1511,6 +1521,8 @@ test('capture version advances for semantic events, terminal state, and finalize
     const finalizedVersion = capture.version;
     assert.ok(requestVersion > armedVersion);
     assert.ok(semanticVersion > requestVersion);
+    assert.equal(semanticMatch.matchedSource, 'eventsource');
+    assert.deepEqual(rawMatch, {matched: false});
     assert.ok(terminalVersion > semanticVersion);
     assert.ok(finalizedVersion > terminalVersion);
   } finally {

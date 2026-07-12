@@ -168,10 +168,11 @@ Finalize waits for expected ExtraInfo with a bounded deadline. Late ExtraInfo re
 ```text
 eventPredicate = exact_data | event_name | json_path_equals
 afterEventIndex
+eventSource = raw-stream | eventsource (optional)
 requestId (optional)
 ```
 
-The collector scans the complete on-disk `events.jsonl` / `eventsource.jsonl` sequence. It does not depend on bounded recent-event summaries, so a target remains matchable after dozens of later events. MCP returns only:
+The collector scans the complete on-disk `events.jsonl` or `eventsource.jsonl` sequence selected by `eventSource`. Raw parser records and EventSource semantic records have independent indices; downstream adapters must keep a cursor for each source instead of merging counts with `max()`. The matcher does not depend on bounded recent-event summaries, so a target remains matchable after dozens of later events. MCP returns only:
 
 ```text
 matched
@@ -310,7 +311,7 @@ Only active `armed` or `capturing` captures are changed when a page closes. A st
 
 ## Downstream wait contract
 
-Polling `get_stream_status` is available to ordinary MCP clients. A higher-level private adapter should expose an internal wait method rather than a GPT-visible Action. For body predicates it passes `eventPredicate` and the last `afterEventIndex`; the collector returns only match metadata:
+Polling `get_stream_status` is available to ordinary MCP clients. A higher-level private adapter should expose an internal wait method rather than a GPT-visible Action. For body predicates it passes `eventPredicate`, the source-specific `afterEventIndex`, and `eventSource`; the collector returns only match metadata:
 
 ```text
 waitForStreamCondition(

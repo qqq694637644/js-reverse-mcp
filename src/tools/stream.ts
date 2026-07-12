@@ -593,7 +593,7 @@ export const startStreamCapture = defineTool({
 export const getStreamStatus = defineTool({
   name: 'get_stream_status',
   description:
-    'Ordinary MCP primitive that returns bounded status for a global capture ID. Optional eventPredicate plus afterEventIndex matches exact_data, event_name, or json_path_equals against the complete on-disk event sequence and returns only match metadata. It never returns event bodies, credentials, raw bytes, Base64, payload artifacts, or host absolute paths.',
+    'Ordinary MCP primitive that returns bounded status for a global capture ID. Optional eventPredicate plus afterEventIndex and eventSource matches exact_data, event_name, or json_path_equals against one complete on-disk event sequence and returns only match metadata. It never returns event bodies, credentials, raw bytes, Base64, payload artifacts, or host absolute paths.',
   annotations: {
     title: 'Get Stream Capture Status',
     category: ToolCategory.NETWORK,
@@ -614,6 +614,7 @@ export const getStreamStatus = defineTool({
     includeRecentChunks: zod.boolean().default(false),
     eventPredicate: eventPredicateSchema.optional(),
     afterEventIndex: zod.number().int().min(-1).default(-1),
+    eventSource: zod.enum(['raw-stream', 'eventsource']).optional(),
     pageIdx: zod.number().int().min(0).default(0),
     pageSize: zod.number().int().positive().max(100).default(20),
   },
@@ -623,6 +624,7 @@ export const getStreamStatus = defineTool({
       ? await context.findStreamEventMatch(request.params.captureId, {
           requestId: request.params.requestId,
           afterEventIndex: request.params.afterEventIndex,
+          eventSource: request.params.eventSource,
           predicate: request.params.eventPredicate,
         })
       : undefined;

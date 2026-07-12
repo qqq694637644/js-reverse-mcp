@@ -89,6 +89,7 @@ export interface StreamEventMatch {
 export interface StreamEventMatchQuery {
   requestId?: string;
   afterEventIndex?: number;
+  eventSource?: StreamEventSource;
   predicate: StreamEventPredicate;
 }
 
@@ -3481,10 +3482,14 @@ export class StreamCollector {
         continue;
       }
       await runtime.writeChain.catch(() => undefined);
-      for (const [kind, source] of [
+      const sources = [
         ['events', 'raw-stream'],
         ['eventsource_events', 'eventsource'],
-      ] as const) {
+      ] as const;
+      for (const [kind, source] of sources) {
+        if (query.eventSource && query.eventSource !== source) {
+          continue;
+        }
         const artifact = runtime.artifacts.get(kind);
         if (!artifact || artifact.descriptor.writeStatus === 'failed') {
           continue;
