@@ -17,6 +17,12 @@ import {assertLocalFileWriteAllowed} from './LocalFileAccess.js';
 import {NetworkCollector, ConsoleCollector} from './PageCollector.js';
 import type {ListenerMap, RequestInitiator} from './PageCollector.js';
 import type {
+  StreamCapture,
+  StreamCaptureFilter,
+  StreamRequest,
+} from './StreamCollector.js';
+import {StreamCollector} from './StreamCollector.js';
+import type {
   BrowserContext,
   ConsoleMessage,
   Debugger,
@@ -65,6 +71,7 @@ export class McpContext implements Context {
   #networkCollector: NetworkCollector;
   #consoleCollector: ConsoleCollector;
   #webSocketCollector: WebSocketCollector;
+  #streamCollector: StreamCollector;
 
   #dialog?: Dialog;
   #debuggerContext: DebuggerContext = new DebuggerContext();
@@ -107,6 +114,10 @@ export class McpContext implements Context {
     );
 
     this.#webSocketCollector = new WebSocketCollector(
+      this.browserContext,
+      this.sessionProvider,
+    );
+    this.#streamCollector = new StreamCollector(
       this.browserContext,
       this.sessionProvider,
     );
@@ -158,6 +169,8 @@ export class McpContext implements Context {
         await this.#networkCollector.initCdp();
       } else if (capability === 'websocket') {
         await this.#webSocketCollector.init();
+      } else if (capability === 'stream') {
+        await this.#streamCollector.init();
       }
       return;
     }
@@ -175,6 +188,9 @@ export class McpContext implements Context {
           break;
         case 'websocket':
           await this.#webSocketCollector.init();
+          break;
+        case 'stream':
+          await this.#streamCollector.init();
           break;
         case 'debugger':
           await this.#initDebugger();
@@ -221,6 +237,7 @@ export class McpContext implements Context {
     this.#networkCollector.dispose();
     this.#consoleCollector.dispose();
     this.#webSocketCollector.dispose();
+    this.#streamCollector.dispose();
     void this.#debuggerContext.disable();
   }
 
@@ -326,6 +343,9 @@ export class McpContext implements Context {
     if (this.#initializedCapabilities.has('websocket')) {
       await this.#webSocketCollector.addPage(page);
     }
+    if (this.#initializedCapabilities.has('stream')) {
+      await this.#streamCollector.addPage(page);
+    }
     return page;
   }
   async closePage(pageIdx: number): Promise<void> {
@@ -343,6 +363,26 @@ export class McpContext implements Context {
 
   getNetworkRequestById(reqid: number): HTTPRequest {
     return this.#networkCollector.getById(this.getSelectedPage(), reqid);
+  }
+
+  startStreamCapture(filter: StreamCaptureFilter): StreamCapture {
+    return this.#streamCollector.startCapture(this.getSelectedPage(), filter);
+  }
+
+  getStreamCapture(captureId: number): StreamCapture {
+    return this.#streamCollector.getById(this.getSelectedPage(), captureId);
+  }
+
+  stopStreamCapture(captureId: number): StreamCapture {
+    return this.#streamCollector.stopCapture(this.getSelectedPage(), captureId);
+  }
+
+  getStreamRawBody(request: StreamRequest): Uint8Array<ArrayBufferLike> {
+    return this.#streamCollector.getRawBody(request);
+  }
+
+  getStreamSseEvents(request: StreamRequest) {
+    return this.#streamCollector.getSseEvents(request);
   }
 
   getDialog(): Dialog | undefined {

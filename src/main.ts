@@ -48,6 +48,7 @@ import * as pagesTools from './tools/pages.js';
 import * as screenshotTools from './tools/screenshot.js';
 import * as scriptTools from './tools/script.js';
 import * as siteDataTools from './tools/siteData.js';
+import * as streamTools from './tools/stream.js';
 import {
   TOOL_OUTPUT_SCHEMA,
   type ToolDefinition,
@@ -70,7 +71,9 @@ const SERVER_INSTRUCTIONS = `Use purpose-built tools for network, source, debugg
 
 For captured HTTP/API traffic, redirects, HTTP authentication flows, or cookie provenance, start with list_network_requests. To find where an exact cookie was created, refreshed, rotated, overwritten, or deleted—including HttpOnly, Secure, and SameSite cookies—call list_network_requests with cookieName. Then inspect the returned reqid or export outputPart="responseHeaders" for complete Set-Cookie values and attributes. Use get_request_initiator on a captured reqid to locate client-side JavaScript that initiated that request, if any. Initiator CDP data is not retroactive: if an older reqid has no initiator, reproduce the action after network capability is active and inspect the new reqid, or set break_on_xhr before reproduction. If runtime arguments or local variables are still needed, set break_on_xhr with a narrow URL substring, reproduce the request, inspect get_paused_info, optionally evaluate in the paused frame, and explicitly resume execution.
 
-For code discovery, use search_in_sources when you know text and list_scripts when you do not; read a bounded region with get_script_source or save a complete/minified source with save_script_source. Use get_websocket_messages for WebSocket frames rather than the HTTP upgrade request. WebSocket frame capture is not retroactive: call get_websocket_messages once before reloading or reproducing an already-finished socket flow because earlier frames cannot be recovered. Select the correct page before page-scoped work. Select a frame for iframe-specific source, debugger, evaluate, or click work; network and cookie evidence is page-scoped and does not require frame selection. Prefer click_element for one known interaction. For code evaluation, clicks, deletion of state/evidence, or breakpoint removal, set confirm=true only when the user explicitly authorizes that specific effect; otherwise request confirmation.`;
+For streaming HTTP responses such as fetch/XHR text/event-stream, call start_stream_capture before reproducing the action, then inspect ordered SSE events or chunk metadata with get_stream_chunks and finish with stop_stream_capture. Use export_stream_capture when exact retained bytes are required; ordinary response-body export may be unavailable after Chromium evicts a completed stream. Use get_websocket_messages for WebSocket frames rather than the HTTP upgrade request. WebSocket and stream capture are not retroactive.
+
+For code discovery, use search_in_sources when you know text and list_scripts when you do not; read a bounded region with get_script_source or save a complete/minified source with save_script_source. Select the correct page before page-scoped work. Select a frame for iframe-specific source, debugger, evaluate, or click work; network and cookie evidence is page-scoped and does not require frame selection. Prefer click_element for one known interaction. For code evaluation, clicks, deletion of state/evidence, or breakpoint removal, set confirm=true only when the user explicitly authorizes that specific effect; otherwise request confirmation.`;
 
 export const args = parseArguments(VERSION);
 configureAllowedRoots(args.allowedRoots);
@@ -262,6 +265,7 @@ const tools = [
   ...Object.values(screenshotTools),
   ...Object.values(scriptTools),
   ...Object.values(siteDataTools),
+  ...Object.values(streamTools),
 
   ...Object.values(websocketTools),
 ].filter(tool => {

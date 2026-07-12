@@ -128,7 +128,7 @@ Other navigation-level safeguards (both modes):
 
 When to enable `--cloak`: only for sites that block you on fingerprint despite all of the above. See [docs/cloak.en.md](docs/cloak.en.md) for the full guide and tradeoffs.
 
-## Tools (24)
+## Tools (28)
 
 ### Page & Navigation
 
@@ -162,13 +162,17 @@ When to enable `--cloak`: only for sites that block you on fingerprint despite a
 | `pause_or_resume`        | Explicitly pause or resume execution                             |
 | `step`                   | Step over, into, or out with source context in response          |
 
-### Network & WebSocket
+### Network, Streaming Responses & WebSocket
 
 | Tool                     | Description                                                                    |
 | ------------------------ | ------------------------------------------------------------------------------ |
 | `list_network_requests`  | List requests, inspect one request, or export raw headers/body/query material  |
 | `clear_network_requests` | Clear the selected page's collected requests and body cache after confirmation |
 | `get_request_initiator`  | Get JavaScript call stack for a network request                                |
+| `start_stream_capture`   | Arm fetch/XHR SSE and native EventSource capture before an action              |
+| `get_stream_chunks`      | Inspect ordered SSE events or raw chunk metadata                               |
+| `stop_stream_capture`    | Stop and freeze a capture without cancelling the browser request               |
+| `export_stream_capture`  | Export exact raw stream bytes or JSON containing events, chunks, and status    |
 | `get_websocket_messages` | List WebSocket connections, analyze messages, or get message details           |
 
 ### Browser State
@@ -216,6 +220,18 @@ Trigger an action on the page, then inspect arguments, call stack and scope vari
 
 ```
 List WebSocket connections, analyze message patterns, view messages of specific types
+```
+
+### SSE / Streaming HTTP Analysis
+
+Stream capture is not retroactive, so arm it before triggering the page action:
+
+```text
+1. start_stream_capture: narrow by URL, method, resource type, or MIME
+2. Trigger the fetch/XHR/EventSource request in the page
+3. get_stream_chunks: inspect ordered SSE events, [DONE], and chunk timing
+4. stop_stream_capture: freeze the result
+5. export_stream_capture: export raw bytes or JSON when exact evidence is needed
 ```
 
 ### Agent-Friendly Full Capture Flow

@@ -2,7 +2,7 @@
 
 # Chrome DevTools MCP Tool Reference
 
-**Total: 24 tools.**
+**Total: 28 tools.**
 
 Every tool declares an MCP output schema. Successful calls and errors raised by
 tool handlers or runtime operations return `structuredContent` with a stable
@@ -18,10 +18,14 @@ content is kept for human-readable compatibility.
   - [`select_page`](#select_page)
 - **[Browser state](#browser-state)** (1 tool)
   - [`clear_site_data`](#clear_site_data)
-- **[Network](#network)** (3 tools)
+- **[Network](#network)** (7 tools)
   - [`clear_network_requests`](#clear_network_requests)
+  - [`export_stream_capture`](#export_stream_capture)
+  - [`get_stream_chunks`](#get_stream_chunks)
   - [`get_websocket_messages`](#get_websocket_messages)
   - [`list_network_requests`](#list_network_requests)
+  - [`start_stream_capture`](#start_stream_capture)
+  - [`stop_stream_capture`](#stop_stream_capture)
 - **[Debugging](#debugging)** (4 tools)
   - [`evaluate_script`](#evaluate_script)
   - [`list_console_messages`](#list_console_messages)
@@ -118,6 +122,34 @@ content is kept for human-readable compatibility.
 
 ---
 
+### `export_stream_capture`
+
+**Description:** Export exact retained streaming-response evidence to a local file. Use format="raw" for the concatenated response bytes of one request, or format="json" for capture metadata, chunk base64, EventSource messages, and parsed SSE events. Subject to --allowedRoots.
+
+**Parameters:**
+
+- **captureId** (integer) **(required)**
+- **confirmOverwrite** (boolean) _(optional)_
+- **format** (enum: "raw", "json") _(optional)_
+- **outputFile** (string) **(required)**
+- **requestId** (string) _(optional)_: Required for raw export when a capture contains multiple requests. Optional for JSON export.
+
+---
+
+### `get_stream_chunks`
+
+**Description:** Inspect a previously armed streaming-response capture. Without requestId it lists matched streaming requests. With requestId it returns parsed SSE events, raw chunk metadata, or both. Parsed events preserve order and identify [DONE]; native EventSource messages are used as a fallback when raw bytes are unavailable. Exact bytes should be exported with [`export_stream_capture`](#export_stream_capture).
+
+**Parameters:**
+
+- **captureId** (integer) **(required)**
+- **pageIdx** (integer) _(optional)_
+- **pageSize** (integer) _(optional)_
+- **requestId** (string) _(optional)_: CDP requestId from the capture request list. Omit to list matched requests.
+- **view** (enum: "events", "chunks", "all") _(optional)_: With requestId, return parsed SSE events, raw chunk metadata, or both.
+
+---
+
 ### `get_websocket_messages`
 
 **Description:** Inspect captured bidirectional WebSocket connections and frame payloads for the selected page. Use this for WebSocket, socket, live-update, push, streaming, or realtime message flows; use [`list_network_requests`](#list_network_requests) for ordinary HTTP/XHR/fetch traffic and WebSocket upgrade request headers. WebSocket capture starts lazily on this tool's first use and is not retroactive: if the relevant socket already connected or exchanged frames, call this tool once to initialize capture, then reload or reproduce the flow. Without wsid it lists connections so you can choose one. With wsid it lists paginated sent/received frames; add show_content=true for payload previews. With wsid and analyze=true it groups frames by payload pattern and returns group IDs and sample frame indices; then use groupId to inspect one pattern. With wsid and frameIndex it returns one retained frame's detailed payload using the stable index shown in frame tables or analysis samples.
@@ -153,6 +185,29 @@ content is kept for human-readable compatibility.
 - **reqid** (number) _(optional)_: Inspect one captured request by the reqid returned by request-list or cookie-flow mode. Omit it to list/filter requests or trace cookie setters. Add outputFile when exact, complete, or large data is needed.
 - **resourceTypes** (array) _(optional)_: Filter requests to only return requests of the specified resource types (xhr, fetch, document, script, ...). This is the resource category, NOT the HTTP verb — use methods for GET/POST filtering. When omitted or empty, returns all requests.
 - **urlFilter** (string) _(optional)_: Filter request-list results to URLs containing this substring. Use an endpoint path, host, query fragment, or other known URL text; combine with methods/resourceTypes to narrow an API flow.
+
+---
+
+### `start_stream_capture`
+
+**Description:** Arm streaming HTTP response capture for the selected page before reproducing an action. It uses Network.streamResourceContent so fetch/XHR text-event-stream bytes are retained during delivery, and also records native EventSource messages. Only one capture may be active per selected page. The default MIME filter is text/event-stream; narrow with URL, method, resource type, or MIME filters. Follow with [`get_stream_chunks`](#get_stream_chunks), then [`stop_stream_capture`](#stop_stream_capture).
+
+**Parameters:**
+
+- **methods** (array) _(optional)_: Optional HTTP method filter, such as ["POST"].
+- **mimeTypes** (array) _(optional)_: Response MIME prefixes to capture. Defaults to ["text/event-stream"]. Pass explicit values for NDJSON or another streaming format.
+- **resourceTypes** (array) _(optional)_: Optional CDP/Playwright resource-type filter, such as ["fetch","eventsource"].
+- **urlFilter** (string) _(optional)_: Only capture response URLs containing this substring.
+
+---
+
+### `stop_stream_capture`
+
+**Description:** Stop an armed stream capture for the selected page. This freezes the retained bytes and semantic events but does not cancel the browser request. Call after the reproduced action has completed or after the desired cancellation/error state was observed.
+
+**Parameters:**
+
+- **captureId** (integer) **(required)**
 
 ---
 

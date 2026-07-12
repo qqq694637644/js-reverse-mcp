@@ -13,13 +13,14 @@ import type {Tool} from '@modelcontextprotocol/sdk/types.js';
 
 const MCP_SERVER_PATH = 'build/src/index.js';
 const CORPUS_PATH = 'evals/tool-routing.json';
-const EXPECTED_TOOL_COUNT = 24;
+const EXPECTED_TOOL_COUNT = 28;
 const MIN_CASES = 20;
-const MAX_CASES = 30;
+const MAX_CASES = 40;
 const REQUIRED_CATEGORIES = [
   'cookie_network',
   'initiator_breakpoint',
   'scripts',
+  'streaming',
   'websocket',
   'page_frame',
   'destructive_actions',

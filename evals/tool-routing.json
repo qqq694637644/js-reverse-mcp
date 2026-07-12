@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "expectedToolCount": 24,
+  "expectedToolCount": 28,
   "cases": [
     {
       "id": "console-errors",
@@ -241,6 +241,47 @@
       "prompt": "列出当前页面的 frame 和 iframe，但不要改变当前执行上下文。",
       "expectedTool": "select_frame",
       "expectedArgs": {}
+    },
+    {
+      "id": "start-sse-capture",
+      "category": "streaming",
+      "prompt": "Before I submit the next chat message, arm streaming response capture for POST fetch requests whose URL contains /conversation.",
+      "expectedTool": "start_stream_capture",
+      "expectedArgs": {
+        "urlFilter": "/conversation",
+        "methods": ["POST"],
+        "resourceTypes": ["fetch"]
+      }
+    },
+    {
+      "id": "inspect-sse-events",
+      "category": "streaming",
+      "prompt": "Stream capture 4 contains request 123.4. Return its parsed SSE events in order, including the ending marker.",
+      "expectedTool": "get_stream_chunks",
+      "expectedArgs": {
+        "captureId": 4,
+        "requestId": "123.4",
+        "view": "events"
+      }
+    },
+    {
+      "id": "stop-sse-capture",
+      "category": "streaming",
+      "prompt": "The reproduced streaming action is complete. Stop stream capture 4 without cancelling the browser request.",
+      "expectedTool": "stop_stream_capture",
+      "expectedArgs": {"captureId": 4}
+    },
+    {
+      "id": "export-sse-bytes",
+      "category": "streaming",
+      "prompt": "Export the exact retained raw bytes for request 123.4 from stream capture 4 to the new file /tmp/conversation.sse.",
+      "expectedTool": "export_stream_capture",
+      "expectedArgs": {
+        "captureId": 4,
+        "requestId": "123.4",
+        "format": "raw",
+        "outputFile": "/tmp/conversation.sse"
+      }
     }
   ]
 }
