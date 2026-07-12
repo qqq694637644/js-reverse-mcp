@@ -1465,6 +1465,32 @@ test('event predicate matching survives recent-event eviction and supports JSON 
       predicate: {type: 'exact_data', value: 'special-target'},
     });
     assert.deepEqual(afterTarget, {matched: false});
+    const eventsArtifact = capture.requests[0].artifacts.find(
+      artifact => artifact.kind === 'events',
+    );
+    assert.ok(eventsArtifact);
+    const eventsPath = artifactPath(root, eventsArtifact);
+    const eventsBytes = await fs.readFile(eventsPath);
+    const firstNewline = eventsBytes.indexOf(0x0a);
+    assert.ok(firstNewline >= 0);
+    const handle = await fs.open(eventsPath, 'r+');
+    try {
+      await handle.write(Buffer.from(' '), 0, 1, firstNewline);
+    } finally {
+      await handle.close();
+    }
+    const seekedJson = await collector.findEventMatch(capture.id, {
+      requestId,
+      afterEventIndex: 0,
+      eventSource: 'raw-stream',
+      predicate: {
+        type: 'json_path_equals',
+        path: '$.type',
+        value: 'needle',
+      },
+    });
+    assert.equal(seekedJson.matched, true);
+    assert.equal(seekedJson.matchedEventIndex, 1);
   } finally {
     await collector.dispose();
     await fs.rm(root, {recursive: true, force: true});

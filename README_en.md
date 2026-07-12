@@ -277,7 +277,7 @@ Streaming capture requires both `--allowedRoots` and `--streamArtifactRoot`. Wit
 
 Request snapshots keep ordinary headers, redirect-hop CDP ExtraInfo, UTF-8 `postData`, and explicit completeness metadata separately. They are not wire-level body bytes. `requestSnapshotIntegrity` uses the weakest headers/body dimension and `replayReadiness` is reported separately. Credential artifacts are marked `credential` and have separate redacted header artifacts for default reading.
 
-`get_stream_status` accepts a controlled `eventPredicate`, a source-specific `afterEventIndex`, and optional `eventSource=raw-stream|eventsource`. The collector matches `exact_data`, `event_name`, or `json_path_equals` against the selected full event artifact and returns only match metadata, never the event body. Raw and semantic events retain independent indices. Page listings also return a stable `pageId` that can be selected after tab indices shift.
+`get_stream_status` accepts a controlled `eventPredicate`, a source-specific `afterEventIndex`, and optional `eventSource=raw-stream|eventsource`. As each JSONL event is written, the collector records `event index -> byte offset`; queries seek directly to records after the cursor instead of rescanning the file prefix. It returns only match metadata, never the event body. Raw and semantic events retain independent indices. Page listings also return a stable `pageId` that can be selected after tab indices shift.
 
 ### Example Configurations
 

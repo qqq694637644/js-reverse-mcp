@@ -277,7 +277,7 @@ CLI 保持精简，所有 flag 都是可选项。**99% 场景默认即可**。�
 
 请求快照会按 redirect hop 保存普通 headers、CDP ExtraInfo、UTF-8 `postData` 文本及其完整性说明。它不是 wire-level body。`requestSnapshotIntegrity` 取 headers/body 的最低状态，并额外返回 `replayReadiness`。凭据文件标记为 `credential`，并同时生成默认可读的脱敏 headers artifact。
 
-`get_stream_status` 支持受控 `eventPredicate`、source-specific `afterEventIndex` 和可选 `eventSource=raw-stream|eventsource`。collector 在对应的完整事件 artifact 中执行 `exact_data`、`event_name` 或 `json_path_equals` 匹配，只返回匹配索引、request ID 和来源，不返回事件正文。Raw 与 semantic 事件使用独立索引。页面列表还返回稳定 `pageId`，后续可按 ID 选择，避免 tab index 变化导致错页。
+`get_stream_status` 支持受控 `eventPredicate`、source-specific `afterEventIndex` 和可选 `eventSource=raw-stream|eventsource`。collector 在写入每条 JSONL 事件时维护 `event index → byte offset`，查询时直接 seek 到 cursor 后的记录，而不是每轮从文件头扫描。它只返回匹配索引、request ID 和来源，不返回事件正文。Raw 与 semantic 事件使用独立索引。页面列表还返回稳定 `pageId`，后续可按 ID 选择，避免 tab index 变化导致错页。
 
 ### 示例配置
 

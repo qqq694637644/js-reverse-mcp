@@ -404,6 +404,8 @@ interface RequestRuntime {
   nextSemanticEventIndex: number;
   scheduledRawEvents: number;
   scheduledSemanticEvents: number;
+  rawEventOffsets: Map<number, number>;
+  semanticEventOffsets: Map<number, number>;
   writeChain: Promise<void>;
   activationPromise: Promise<void>;
   activationAbort: AbortController;
@@ -1655,6 +1657,8 @@ export class StreamCollector {
       nextSemanticEventIndex: 0,
       scheduledRawEvents: 0,
       scheduledSemanticEvents: 0,
+      rawEventOffsets: new Map(),
+      semanticEventOffsets: new Map(),
       writeChain: Promise.resolve(),
       activationPromise: Promise.resolve(),
       activationAbort: new AbortController(),
@@ -2415,18 +2419,21 @@ export class StreamCollector {
       }
       try {
         const line = toJsonLine(materialized.record);
+        const lineOffset = target.descriptor.bytes;
         await target.handle.write(line);
         target.hash.update(line);
         target.descriptor.bytes += line.length;
         target.descriptor.sha256 = target.hash.copy().digest('hex');
         target.descriptor.writeStatus = 'written';
         if (destination === 'raw') {
+          runtime.rawEventOffsets.set(event.index, lineOffset);
           request.rawEventCount++;
           runtime.capture.rawEventCount++;
           request.primaryEventSource = 'raw-stream';
           request.recentRawEvents.push(materialized.summary);
           this.#trimRecent(request.recentRawEvents);
         } else {
+          runtime.semanticEventOffsets.set(event.index, lineOffset);
           request.semanticEventCount++;
           runtime.capture.semanticEventCount++;
           if (request.primaryEventSource === 'none') {
@@ -3498,7 +3505,24 @@ export class StreamCollector {
           runtime.absoluteDir,
           artifact.relativeToRequestDir,
         );
-        const stream = createReadStream(filePath, {encoding: 'utf8'});
+        const offsets =
+          source === 'raw-stream'
+            ? runtime.rawEventOffsets
+            : runtime.semanticEventOffsets;
+        let startOffset: number | undefined;
+        for (const [index, offset] of offsets) {
+          if (index > afterEventIndex) {
+            startOffset = offset;
+            break;
+          }
+        }
+        if (startOffset === undefined) {
+          continue;
+        }
+        const stream = createReadStream(filePath, {
+          encoding: 'utf8',
+          start: startOffset,
+        });
         const lines = createInterface({input: stream, crlfDelay: Infinity});
         try {
           for await (const line of lines) {

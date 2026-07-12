@@ -172,7 +172,7 @@ eventSource = raw-stream | eventsource (optional)
 requestId (optional)
 ```
 
-The collector scans the complete on-disk `events.jsonl` or `eventsource.jsonl` sequence selected by `eventSource`. Raw parser records and EventSource semantic records have independent indices; downstream adapters must keep a cursor for each source instead of merging counts with `max()`. The matcher does not depend on bounded recent-event summaries, so a target remains matchable after dozens of later events. MCP returns only:
+The collector keeps a source-specific in-memory `event index -> JSONL byte offset` index as each event line is written. A predicate query seeks directly to the first record after `afterEventIndex` in the selected `events.jsonl` or `eventsource.jsonl` file instead of parsing the old prefix on every poll. Raw parser records and EventSource semantic records have independent indices; downstream adapters must keep a cursor for each source instead of merging counts with `max()`. The matcher does not depend on bounded recent-event summaries, so a target remains matchable after dozens of later events without O(n²) repeated scans. MCP returns only:
 
 ```text
 matched
@@ -311,7 +311,7 @@ Only active `armed` or `capturing` captures are changed when a page closes. A st
 
 ## Downstream wait contract
 
-Polling `get_stream_status` is available to ordinary MCP clients. A higher-level private adapter should expose an internal wait method rather than a GPT-visible Action. For body predicates it passes `eventPredicate`, the source-specific `afterEventIndex`, and `eventSource`; the collector returns only match metadata:
+Polling `get_stream_status` is available to ordinary MCP clients. A higher-level private adapter should expose an internal wait method rather than a GPT-visible Action. For body predicates it passes `eventPredicate`, the source-specific `afterEventIndex`, and `eventSource`; the collector uses its source-specific JSONL offset index to seek after the cursor and returns only match metadata:
 
 ```text
 waitForStreamCondition(
