@@ -7,6 +7,13 @@
 import type {DebuggerContext} from '../DebuggerContext.js';
 import type {TrafficSummary} from '../formatters/websocketFormatter.js';
 import type {RequestInitiator} from '../PageCollector.js';
+import type {
+  StreamCapture,
+  StreamCaptureFilter,
+  StreamEventMatch,
+  StreamEventMatchQuery,
+  StreamCaptureOptions,
+} from '../StreamCollector.js';
 import {zod} from '../third_party/index.js';
 import type {Dialog, Frame, HTTPRequest, Page} from '../third_party/index.js';
 import {TOOL_ERROR_CODES} from '../ToolError.js';
@@ -18,6 +25,7 @@ import type {ToolCategory} from './categories.js';
 export const TOOL_CAPABILITIES = [
   'debugger',
   'network',
+  'stream',
   'websocket',
   'devtools-ui',
 ] as const;
@@ -146,6 +154,8 @@ export type Context = Readonly<{
   clearDialog(): void;
   getPages(): Page[];
   getPageByIdx(idx: number): Page;
+  getPageStableId(page: Page): string;
+  getPageByStableId(pageId: string): Page;
   isPageSelected(page: Page): boolean;
   newPage(): Promise<Page>;
   closePage(pageIdx: number): Promise<void>;
@@ -193,6 +203,19 @@ export type Context = Readonly<{
    * dropped so the caller can report it.
    */
   clearNetworkRequests(): {requestCount: number; reclaimedBytes: number};
+  startStreamCapture(
+    filter: StreamCaptureFilter,
+    options?: StreamCaptureOptions & {artifactNamespace?: string},
+  ): Promise<StreamCapture>;
+  getStreamCapture(captureId: number): StreamCapture;
+  findStreamEventMatch(
+    captureId: number,
+    query: StreamEventMatchQuery,
+  ): Promise<StreamEventMatch>;
+  stopStreamCapture(
+    captureId: number,
+    options?: {signal?: AbortSignal; deadlineWallTimeMs?: number},
+  ): Promise<StreamCapture>;
   /**
    * Get all WebSocket connections for the selected page.
    */

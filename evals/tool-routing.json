@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "expectedToolCount": 24,
+  "expectedToolCount": 27,
   "cases": [
     {
       "id": "console-errors",
@@ -241,6 +241,35 @@
       "prompt": "列出当前页面的 frame 和 iframe，但不要改变当前执行上下文。",
       "expectedTool": "select_frame",
       "expectedArgs": {}
+    },
+    {
+      "id": "start-sse-capture",
+      "category": "streaming",
+      "prompt": "Before I submit the next chat message, arm streaming response capture for POST fetch requests whose URL contains /conversation. Let the server allocate the artifact directory.",
+      "expectedTool": "start_stream_capture",
+      "expectedArgs": {
+        "urlFilter": "/conversation",
+        "methods": ["POST"],
+        "resourceTypes": ["fetch"]
+      }
+    },
+    {
+      "id": "inspect-sse-events",
+      "category": "streaming",
+      "prompt": "Stream capture 4 contains request 123.4. Show its completion status, artifact paths, and paginated chunk offsets without returning event bodies.",
+      "expectedTool": "get_stream_status",
+      "expectedArgs": {
+        "captureId": 4,
+        "requestId": "123.4",
+        "includeRecentChunks": true
+      }
+    },
+    {
+      "id": "stop-sse-capture",
+      "category": "streaming",
+      "prompt": "The reproduced streaming action is complete. Stop stream capture 4 without cancelling the browser request.",
+      "expectedTool": "stop_stream_capture",
+      "expectedArgs": {"captureId": 4}
     }
   ]
 }

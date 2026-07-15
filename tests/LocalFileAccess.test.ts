@@ -5,17 +5,20 @@
  */
 
 import assert from 'node:assert/strict';
+import {constants as fsConstants} from 'node:fs';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import {afterEach, test} from 'node:test';
 
 import {
+  allocateSecureArtifactDirectory,
   assertBrowserUrlAllowed,
   assertLocalFileReadAllowed,
   assertLocalFileWriteAllowed,
   configureAllowedRoots,
   getAllowedRoots,
+  openSecureArtifactFile,
 } from '../src/LocalFileAccess.js';
 import {McpContext} from '../src/McpContext.js';
 import {ToolError} from '../src/ToolError.js';
@@ -30,10 +33,7 @@ test('allowed roots permit contained reads and writes', async () => {
   try {
     const realRoot = await fs.realpath(root);
     configureAllowedRoots([root]);
-    assert.equal(
-      assertLocalFileReadAllowed(input),
-      path.join(realRoot, 'input.txt'),
-    );
+    assert.equal(assertLocalFileReadAllowed(input), await fs.realpath(input));
     assert.equal(
       assertLocalFileWriteAllowed(path.join(root, 'output.txt')),
       path.join(realRoot, 'output.txt'),
@@ -112,6 +112,100 @@ test('omitting allowed roots preserves unrestricted compatibility', () => {
     assertLocalFileReadAllowed(import.meta.filename),
     import.meta.filename,
   );
+});
+
+test('secure stream artifact allocation requires an allowed root', async () => {
+  configureAllowedRoots();
+  await assert.rejects(
+    allocateSecureArtifactDirectory('0'),
+    (error: unknown) =>
+      error instanceof ToolError && error.code === 'PERMISSION_DENIED',
+  );
+});
+
+test('stream artifact root selector chooses an explicit allowed root', async () => {
+  const parent = await fs.mkdtemp(path.join(os.tmpdir(), 'mcp-stream-roots-'));
+  const first = path.join(parent, 'first');
+  const second = path.join(parent, 'second');
+  await fs.mkdir(first);
+  await fs.mkdir(second);
+  try {
+    configureAllowedRoots([first, second]);
+    const allocated = await allocateSecureArtifactDirectory('1');
+    assert.equal(allocated.rootIndex, 1);
+    assert.equal(allocated.rootPath, (await getAllowedRoots())?.[1]);
+    assert.equal(
+      allocated.absoluteDir.startsWith(await fs.realpath(second)),
+      true,
+    );
+  } finally {
+    await fs.rm(parent, {recursive: true, force: true});
+  }
+});
+
+test('backend namespace allocates capture inside an experiment directory', async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'mcp-experiment-root-'));
+  try {
+    configureAllowedRoots([root]);
+    const allocated = await allocateSecureArtifactDirectory('0', {
+      parentSegments: ['experiments', 'exp_001', 'js-reverse'],
+      prefix: 'capture',
+    });
+    const portable = allocated.relativeDir.split(path.sep).join('/');
+    assert.match(portable, /^experiments\/exp_001\/js-reverse\/capture-/);
+    assert.equal(
+      allocated.absoluteDir.startsWith(await fs.realpath(root)),
+      true,
+    );
+  } finally {
+    await fs.rm(root, {recursive: true, force: true});
+  }
+});
+
+test('stream artifact allocation rejects a symlink parent', async () => {
+  const parent = await fs.mkdtemp(path.join(os.tmpdir(), 'mcp-stream-link-'));
+  const root = path.join(parent, 'root');
+  const outside = path.join(parent, 'outside');
+  await fs.mkdir(root);
+  await fs.mkdir(outside);
+  await fs.symlink(outside, path.join(root, 'js-reverse-streams'), 'junction');
+  try {
+    configureAllowedRoots([root]);
+    await assert.rejects(
+      allocateSecureArtifactDirectory('0'),
+      (error: unknown) =>
+        error instanceof ToolError && error.code === 'PERMISSION_DENIED',
+    );
+  } finally {
+    await fs.rm(parent, {recursive: true, force: true});
+  }
+});
+
+test('secure artifact open rejects a capture directory replaced by a symlink', async () => {
+  const parent = await fs.mkdtemp(path.join(os.tmpdir(), 'mcp-stream-swap-'));
+  const root = path.join(parent, 'root');
+  const outside = path.join(parent, 'outside');
+  await fs.mkdir(root);
+  await fs.mkdir(outside);
+  try {
+    configureAllowedRoots([root]);
+    const allocated = await allocateSecureArtifactDirectory('0');
+    const original = `${allocated.absoluteDir}.original`;
+    await fs.rename(allocated.absoluteDir, original);
+    await fs.symlink(outside, allocated.absoluteDir, 'junction');
+    await assert.rejects(
+      openSecureArtifactFile(
+        allocated.rootPath,
+        allocated.absoluteDir,
+        'escape.bin',
+        fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL,
+      ),
+      (error: unknown) =>
+        error instanceof ToolError && error.code === 'PERMISSION_DENIED',
+    );
+  } finally {
+    await fs.rm(parent, {recursive: true, force: true});
+  }
 });
 
 test('allowed roots disable browser file and view-source:file pages', async () => {

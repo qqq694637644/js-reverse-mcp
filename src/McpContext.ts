@@ -4,6 +4,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+import {randomUUID} from 'node:crypto';
 import {constants as fsConstants} from 'node:fs';
 import fs from 'node:fs/promises';
 import os from 'node:os';
@@ -13,9 +14,20 @@ import {CdpSessionProvider} from './CdpSessionProvider.js';
 import {DebuggerContext} from './DebuggerContext.js';
 import {extractUrlLikeFromDevToolsTitle, urlsEqual} from './DevtoolsUtils.js';
 import type {TrafficSummary} from './formatters/websocketFormatter.js';
-import {assertLocalFileWriteAllowed} from './LocalFileAccess.js';
+import {
+  allocateSecureArtifactDirectory,
+  assertLocalFileWriteAllowed,
+} from './LocalFileAccess.js';
 import {NetworkCollector, ConsoleCollector} from './PageCollector.js';
 import type {ListenerMap, RequestInitiator} from './PageCollector.js';
+import type {
+  StreamCapture,
+  StreamCaptureFilter,
+  StreamEventMatch,
+  StreamEventMatchQuery,
+  StreamCaptureOptions,
+} from './StreamCollector.js';
+import {StreamCollector} from './StreamCollector.js';
 import type {
   BrowserContext,
   ConsoleMessage,
@@ -60,11 +72,14 @@ export class McpContext implements Context {
 
   // The most recent page state.
   #pages: Page[] = [];
+  #pageIds = new WeakMap<Page, string>();
+  #pagesById = new Map<string, Page>();
   #pageToDevToolsPage = new Map<Page, Page>();
   #selectedPage?: Page;
   #networkCollector: NetworkCollector;
   #consoleCollector: ConsoleCollector;
   #webSocketCollector: WebSocketCollector;
+  #streamCollector: StreamCollector;
 
   #dialog?: Dialog;
   #debuggerContext: DebuggerContext = new DebuggerContext();
@@ -75,7 +90,17 @@ export class McpContext implements Context {
     Map<number, {version: number; summary: TrafficSummary}>
   >();
 
-  private constructor(browserContext: BrowserContext, logger: Debugger) {
+  private constructor(
+    browserContext: BrowserContext,
+    logger: Debugger,
+    options: {
+      streamMaxBytes?: number;
+      streamArtifactRoot?: string;
+      streamActivationTimeoutMs?: number;
+      streamPendingMaxBytes?: number;
+      streamMaxSseEventBytes?: number;
+    } = {},
+  ) {
     this.browserContext = browserContext;
     this.sessionProvider = new CdpSessionProvider(browserContext);
     this.logger = logger;
@@ -110,7 +135,31 @@ export class McpContext implements Context {
       this.browserContext,
       this.sessionProvider,
     );
+    this.#streamCollector = new StreamCollector(
+      this.browserContext,
+      this.sessionProvider,
+      {
+        maxDiskBytesPerCapture: options.streamMaxBytes,
+        activationTimeoutMs: options.streamActivationTimeoutMs,
+        maxPendingBytesPerRequest: options.streamPendingMaxBytes,
+        maxSseEventBytes: options.streamMaxSseEventBytes,
+        maxIncompleteTailBytes: options.streamMaxSseEventBytes,
+        resolveNetworkRequestId: (page, cdpRequestId) => {
+          const request = this.#networkCollector.find(page, candidate => {
+            return (
+              this.#networkCollector.getCdpRequestId(candidate) === cdpRequestId
+            );
+          });
+          return request
+            ? this.#networkCollector.getIdForResource(request)
+            : undefined;
+        },
+      },
+    );
+    this.#streamArtifactRoot = options.streamArtifactRoot;
   }
+
+  #streamArtifactRoot?: string;
 
   #initializedCapabilities = new Set<ToolCapability>();
   #capabilityInitializers = new Map<ToolCapability, Promise<void>>();
@@ -158,6 +207,8 @@ export class McpContext implements Context {
         await this.#networkCollector.initCdp();
       } else if (capability === 'websocket') {
         await this.#webSocketCollector.init();
+      } else if (capability === 'stream') {
+        await this.#streamCollector.init();
       }
       return;
     }
@@ -175,6 +226,9 @@ export class McpContext implements Context {
           break;
         case 'websocket':
           await this.#webSocketCollector.init();
+          break;
+        case 'stream':
+          await this.#streamCollector.init();
           break;
         case 'debugger':
           await this.#initDebugger();
@@ -217,11 +271,14 @@ export class McpContext implements Context {
     }
   }
 
-  dispose() {
+  async dispose(
+    options: {timeoutMs?: number; reason?: string} = {},
+  ): Promise<void> {
     this.#networkCollector.dispose();
     this.#consoleCollector.dispose();
     this.#webSocketCollector.dispose();
-    void this.#debuggerContext.disable();
+    await this.#streamCollector.dispose(options);
+    await this.#debuggerContext.disable();
   }
 
   /**
@@ -266,8 +323,18 @@ export class McpContext implements Context {
     }
   }
 
-  static async from(browserContext: BrowserContext, logger: Debugger) {
-    const context = new McpContext(browserContext, logger);
+  static async from(
+    browserContext: BrowserContext,
+    logger: Debugger,
+    options: {
+      streamMaxBytes?: number;
+      streamArtifactRoot?: string;
+      streamActivationTimeoutMs?: number;
+      streamPendingMaxBytes?: number;
+      streamMaxSseEventBytes?: number;
+    } = {},
+  ) {
+    const context = new McpContext(browserContext, logger, options);
     await context.#init();
     return context;
   }
@@ -326,6 +393,9 @@ export class McpContext implements Context {
     if (this.#initializedCapabilities.has('websocket')) {
       await this.#webSocketCollector.addPage(page);
     }
+    if (this.#initializedCapabilities.has('stream')) {
+      await this.#streamCollector.addPage(page);
+    }
     return page;
   }
   async closePage(pageIdx: number): Promise<void> {
@@ -343,6 +413,50 @@ export class McpContext implements Context {
 
   getNetworkRequestById(reqid: number): HTTPRequest {
     return this.#networkCollector.getById(this.getSelectedPage(), reqid);
+  }
+
+  async startStreamCapture(
+    filter: StreamCaptureFilter,
+    options: StreamCaptureOptions & {artifactNamespace?: string} = {},
+  ): Promise<StreamCapture> {
+    const parentSegments = options.artifactNamespace
+      ? ['experiments', options.artifactNamespace, 'js-reverse']
+      : ['js-reverse-streams'];
+    const location = await allocateSecureArtifactDirectory(
+      this.#streamArtifactRoot,
+      {parentSegments, prefix: 'capture'},
+    );
+    try {
+      return await this.#streamCollector.startCapture(
+        this.getSelectedPage(),
+        filter,
+        location,
+        {includeInFlight: options.includeInFlight},
+      );
+    } catch (error) {
+      await fs
+        .rm(location.absoluteDir, {recursive: true, force: true})
+        .catch(() => undefined);
+      throw error;
+    }
+  }
+
+  getStreamCapture(captureId: number): StreamCapture {
+    return this.#streamCollector.getById(captureId);
+  }
+
+  async findStreamEventMatch(
+    captureId: number,
+    query: StreamEventMatchQuery,
+  ): Promise<StreamEventMatch> {
+    return this.#streamCollector.findEventMatch(captureId, query);
+  }
+
+  async stopStreamCapture(
+    captureId: number,
+    options: {signal?: AbortSignal; deadlineWallTimeMs?: number} = {},
+  ): Promise<StreamCapture> {
+    return this.#streamCollector.stopCapture(captureId, options);
   }
 
   getDialog(): Dialog | undefined {
@@ -371,6 +485,27 @@ export class McpContext implements Context {
     const page = pages[idx];
     if (!page) {
       throw new Error('No page found');
+    }
+    return page;
+  }
+
+  getPageStableId(page: Page): string {
+    let pageId = this.#pageIds.get(page);
+    if (!pageId) {
+      pageId = `page_${randomUUID()}`;
+      this.#pageIds.set(page, pageId);
+      this.#pagesById.set(pageId, page);
+    }
+    return pageId;
+  }
+
+  getPageByStableId(pageId: string): Page {
+    const page = this.#pagesById.get(pageId);
+    if (!page || page.isClosed() || !this.#pages.includes(page)) {
+      throw new ToolError(
+        'NOT_FOUND',
+        `Page ${pageId} is no longer available. List pages again.`,
+      );
     }
     return page;
   }
@@ -448,6 +583,15 @@ export class McpContext implements Context {
     this.#pages = allPages.filter(
       page => !page.url().startsWith('devtools://'),
     );
+    const currentPages = new Set(this.#pages);
+    for (const [pageId, page] of this.#pagesById) {
+      if (!currentPages.has(page) || page.isClosed()) {
+        this.#pagesById.delete(pageId);
+      }
+    }
+    for (const page of this.#pages) {
+      this.getPageStableId(page);
+    }
 
     if (!this.#selectedPage || this.#pages.indexOf(this.#selectedPage) === -1) {
       await this.selectPage(this.#pages[0]);

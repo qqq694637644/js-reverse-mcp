@@ -128,7 +128,7 @@ Other navigation-level safeguards (both modes):
 
 When to enable `--cloak`: only for sites that block you on fingerprint despite all of the above. See [docs/cloak.en.md](docs/cloak.en.md) for the full guide and tradeoffs.
 
-## Tools (24)
+## Tools (27)
 
 ### Page & Navigation
 
@@ -162,14 +162,17 @@ When to enable `--cloak`: only for sites that block you on fingerprint despite a
 | `pause_or_resume`        | Explicitly pause or resume execution                             |
 | `step`                   | Step over, into, or out with source context in response          |
 
-### Network & WebSocket
+### Network, Streaming Responses & WebSocket
 
-| Tool                     | Description                                                                    |
-| ------------------------ | ------------------------------------------------------------------------------ |
-| `list_network_requests`  | List requests, inspect one request, or export raw headers/body/query material  |
-| `clear_network_requests` | Clear the selected page's collected requests and body cache after confirmation |
-| `get_request_initiator`  | Get JavaScript call stack for a network request                                |
-| `get_websocket_messages` | List WebSocket connections, analyze messages, or get message details           |
+| Tool                     | Description                                                                         |
+| ------------------------ | ----------------------------------------------------------------------------------- |
+| `list_network_requests`  | List requests, inspect one request, or export raw headers/body/query material       |
+| `clear_network_requests` | Clear the selected page's collected requests and body cache after confirmation      |
+| `get_request_initiator`  | Get JavaScript call stack for a network request                                     |
+| `start_stream_capture`   | Start capture; the server allocates a unique directory under the first allowed root |
+| `get_stream_status`      | Inspect a global capture ID, relative paths, and bounded recent chunk offsets       |
+| `stop_stream_capture`    | Await activation and writes, finalize metadata, and return the artifact index       |
+| `get_websocket_messages` | List WebSocket connections, analyze messages, or get message details                |
 
 ### Browser State
 
@@ -218,6 +221,19 @@ Trigger an action on the page, then inspect arguments, call stack and scope vari
 List WebSocket connections, analyze message patterns, view messages of specific types
 ```
 
+### SSE / Streaming HTTP Analysis
+
+Stream capture is not retroactive. MCP always registers the three lifecycle tools. `web_rev_action` should keep this MCP private, call it through an adapter allowlist, and expose only atomic `runBrowserExperiment(capture_flow)` to GPT. See [docs/stream-capture-capability.md](docs/stream-capture-capability.md).
+
+```text
+1. Configure `--allowedRoots` for the Action backend's LocalEvidenceStore and select one root explicitly with `--streamArtifactRoot`
+2. The backend calls start_stream_capture and may pass a constrained experiment namespace so evidence lands under `experiments/<namespace>/js-reverse/`
+3. The backend triggers the fetch/XHR/EventSource request inside the same experiment
+4. get_stream_status returns only status, counts, relative paths, and bounded recent chunk offsets
+5. stop_stream_capture awaits activation, pending chunks, and writes, then returns the final artifact index
+6. Use workspace tools to analyze events.jsonl or decoded.sse; raw.bin remains the exact byte source
+```
+
 ### Agent-Friendly Full Capture Flow
 
 Navigation intentionally stays CDP-silent during the first page load. The recommended flow is to pass risk controls first, then reload with collectors active:
@@ -244,13 +260,24 @@ Navigation intentionally stays CDP-silent during the first page load. The recomm
 
 The CLI stays intentionally small and every flag is optional. Default behavior is what you want 99% of the time. When local files are involved, use `--allowedRoots` to restrict which directories the Agent may read and write.
 
-| Option             | Description                                                                                                                                                                                                                                                                                           | Default |
-| ------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------- |
-| `--cloak`          | Use CloakBrowser stealth-patched Chromium instead of system Chrome. Enables its platform-specific source-level fingerprint patches. Binary auto-downloads (~200MB) on first use. Identity is persisted per profile. See [docs/cloak.en.md](docs/cloak.en.md).                                         | `false` |
-| `--isolated`       | Use a temporary user data directory (cookies/localStorage not persisted, auto-cleaned on close)                                                                                                                                                                                                       | `false` |
-| `--browserUrl, -u` | Connect to a running Chrome instance via CDP HTTP endpoint (e.g. `http://127.0.0.1:9222`). The MCP probes it to find the WebSocket debugger URL. See [docs/cdp-endpoint.en.md](docs/cdp-endpoint.en.md) for how to obtain this endpoint from local Chrome, AdsPower, BitBrowser, etc.                 | –       |
-| `--logFile`        | Write MCP diagnostics to a `0600` regular file. Use only `DEBUG=mcp:*` for verbose logs; never `DEBUG=*`, because browser protocol logs may expose page data, cookies, scripts, and credentials.                                                                                                      | –       |
-| `--allowedRoots`   | Repeatable list of local directories the Agent may read or write. Real paths are pinned and symlink escapes are rejected. While enabled, `file:`, `view-source:file:`, and `filesystem:file:` browser pages are disabled. If omitted, local-file access is unrestricted and startup prints a warning. | –       |
+| Option                        | Description                                                                                                                                                                                                                                                                                           | Default     |
+| ----------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------- |
+| `--cloak`                     | Use CloakBrowser stealth-patched Chromium instead of system Chrome. Enables its platform-specific source-level fingerprint patches. Binary auto-downloads (~200MB) on first use. Identity is persisted per profile. See [docs/cloak.en.md](docs/cloak.en.md).                                         | `false`     |
+| `--isolated`                  | Use a temporary user data directory (cookies/localStorage not persisted, auto-cleaned on close)                                                                                                                                                                                                       | `false`     |
+| `--browserUrl, -u`            | Connect to a running Chrome instance via CDP HTTP endpoint (e.g. `http://127.0.0.1:9222`). The MCP probes it to find the WebSocket debugger URL. See [docs/cdp-endpoint.en.md](docs/cdp-endpoint.en.md) for how to obtain this endpoint from local Chrome, AdsPower, BitBrowser, etc.                 | –           |
+| `--logFile`                   | Write MCP diagnostics to a `0600` regular file. Use only `DEBUG=mcp:*` for verbose logs; never `DEBUG=*`, because browser protocol logs may expose page data, cookies, scripts, and credentials.                                                                                                      | –           |
+| `--allowedRoots`              | Repeatable list of local directories the Agent may read or write. Real paths are pinned and symlink escapes are rejected. While enabled, `file:`, `view-source:file:`, and `filesystem:file:` browser pages are disabled. If omitted, local-file access is unrestricted and startup prints a warning. | –           |
+| `--streamMaxBytes`            | Maximum on-disk bytes for one stream capture. Exceeding the quota explicitly fails the capture and records the truncation time, dropped chunk count, and dropped byte count in the manifest.                                                                                                          | `536870912` |
+| `--streamArtifactRoot`        | Deployment-controlled allowed-root index or exact allowed-root path for stream artifacts. It is required for stream capture and is never a model argument.                                                                                                                                            | –           |
+| `--streamActivationTimeoutMs` | Internal timeout for `Network.streamResourceContent`; timeout creates a finalized failed manifest.                                                                                                                                                                                                    | `10000`     |
+| `--streamPendingMaxBytes`     | Maximum pending bytes retained in memory before activation completes. Exceeding it fails explicitly.                                                                                                                                                                                                  | `8388608`   |
+| `--streamMaxSseEventBytes`    | Semantic parser limit for one SSE event or incomplete tail. Raw evidence continues when parsing degrades.                                                                                                                                                                                             | `8388608`   |
+
+Streaming capture requires both `--allowedRoots` and `--streamArtifactRoot`. With `web_rev_action`, both local processes must see the same analysis workspace directory. MCP returns only an allowed-root index, workspace-relative paths, and opaque artifact IDs—not host absolute paths.
+
+Request snapshots keep ordinary headers, redirect-hop CDP ExtraInfo, UTF-8 `postData`, and explicit completeness metadata separately. They are not wire-level body bytes. `requestSnapshotIntegrity` uses the weakest headers/body dimension and `replayReadiness` is reported separately. Credential artifacts are marked `credential` and have separate redacted header artifacts for default reading.
+
+`get_stream_status` accepts a controlled `eventPredicate`, a source-specific `afterEventIndex`, and optional `eventSource=raw-stream|eventsource`. As each JSONL event is written, the collector records `event index -> byte offset`; queries seek directly to records after the cursor instead of rescanning the file prefix. It returns only match metadata, never the event body. Raw and semantic events retain independent indices. Page listings also return a stable `pageId` that can be selected after tab indices shift.
 
 ### Example Configurations
 

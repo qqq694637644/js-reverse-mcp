@@ -13,13 +13,14 @@ import type {Tool} from '@modelcontextprotocol/sdk/types.js';
 
 const MCP_SERVER_PATH = 'build/src/index.js';
 const CORPUS_PATH = 'evals/tool-routing.json';
-const EXPECTED_TOOL_COUNT = 24;
+const EXPECTED_TOOL_COUNT = 27;
 const MIN_CASES = 20;
-const MAX_CASES = 30;
+const MAX_CASES = 40;
 const REQUIRED_CATEGORIES = [
   'cookie_network',
   'initiator_breakpoint',
   'scripts',
+  'streaming',
   'websocket',
   'page_frame',
   'destructive_actions',
@@ -186,7 +187,9 @@ async function readCorpus(): Promise<RoutingCorpus> {
   };
 }
 
-async function loadMcpMetadata(): Promise<McpMetadata> {
+async function loadMcpMetadata(
+  serverArgs: string[] = [],
+): Promise<McpMetadata> {
   const serverPath = path.resolve(MCP_SERVER_PATH);
   try {
     await fs.access(serverPath);
@@ -198,7 +201,7 @@ async function loadMcpMetadata(): Promise<McpMetadata> {
 
   const transport = new StdioClientTransport({
     command: process.execPath,
-    args: [serverPath],
+    args: [serverPath, ...serverArgs],
     // The transport's default allowlist already prevents eval credentials from
     // reaching the child. Consume stderr without echoing local paths or logs.
     stderr: 'pipe',

@@ -42,6 +42,65 @@ export const cliOptions = {
     description:
       'Optional directories that local-file tools may read from or write to. Repeat the flag for multiple roots. Roots are resolved at startup and symlink escapes are rejected. While configured, file:, view-source:file:, and filesystem:file: browser pages are disabled. When omitted, local-file access is unrestricted and a security warning is printed.',
   },
+  streamMaxBytes: {
+    type: 'number',
+    description:
+      'Maximum on-disk bytes reserved for one streaming-response capture. Defaults to 536870912 (512 MiB). Exceeding the quota marks the capture failed and records explicit truncation statistics.',
+    default: 512 * 1024 * 1024,
+    coerce: (value: number) => {
+      if (!Number.isSafeInteger(value) || value <= 0) {
+        throw new Error('streamMaxBytes must be a positive safe integer.');
+      }
+      return value;
+    },
+  },
+  streamArtifactRoot: {
+    type: 'string',
+    description:
+      'Deployment-controlled allowed-root selector used for stream artifacts. Accepts an allowed-root index such as "0" or an exact configured allowed-root path. Required before stream capture can start.',
+  },
+  streamActivationTimeoutMs: {
+    type: 'number',
+    description:
+      'Internal timeout for Network.streamResourceContent activation. Defaults to 10000ms. Timeout produces a finalized failed or semantic-only manifest instead of leaving a request permanently activating.',
+    default: 10_000,
+    coerce: (value: number) => {
+      if (!Number.isSafeInteger(value) || value <= 0) {
+        throw new Error(
+          'streamActivationTimeoutMs must be a positive safe integer.',
+        );
+      }
+      return value;
+    },
+  },
+  streamPendingMaxBytes: {
+    type: 'number',
+    description:
+      'Maximum in-memory bytes queued while streamResourceContent activation is pending. Defaults to 8388608 (8 MiB). Exceeding it fails activation explicitly.',
+    default: 8 * 1024 * 1024,
+    coerce: (value: number) => {
+      if (!Number.isSafeInteger(value) || value <= 0) {
+        throw new Error(
+          'streamPendingMaxBytes must be a positive safe integer.',
+        );
+      }
+      return value;
+    },
+  },
+  streamMaxSseEventBytes: {
+    type: 'number',
+    description:
+      'Maximum bytes retained by the semantic SSE parser for one event or incomplete tail. Raw capture continues after semantic parsing degrades. Defaults to 8388608 (8 MiB).',
+    default: 8 * 1024 * 1024,
+    coerce: (value: number) => {
+      if (!Number.isSafeInteger(value) || value <= 0) {
+        throw new Error(
+          'streamMaxSseEventBytes must be a positive safe integer.',
+        );
+      }
+      return value;
+    },
+  },
   cloak: {
     type: 'boolean',
     description:
@@ -81,6 +140,10 @@ export function parseArguments(version: string, argv = process.argv) {
       [
         '$0 --allowedRoots /workspace --allowedRoots /tmp/captures',
         'Restrict local-file reads and writes to explicit directories',
+      ],
+      [
+        '$0 --allowedRoots /workspace --streamArtifactRoot 0',
+        'Store stream artifacts under allowed root index 0',
       ],
       ['$0 --help', 'Print CLI options'],
     ]);

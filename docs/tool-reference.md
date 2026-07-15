@@ -2,7 +2,7 @@
 
 # Chrome DevTools MCP Tool Reference
 
-**Total: 24 tools.**
+**Total: 27 tools.**
 
 Every tool declares an MCP output schema. Successful calls and errors raised by
 tool handlers or runtime operations return `structuredContent` with a stable
@@ -18,10 +18,13 @@ content is kept for human-readable compatibility.
   - [`select_page`](#select_page)
 - **[Browser state](#browser-state)** (1 tool)
   - [`clear_site_data`](#clear_site_data)
-- **[Network](#network)** (3 tools)
+- **[Network](#network)** (6 tools)
   - [`clear_network_requests`](#clear_network_requests)
+  - [`get_stream_status`](#get_stream_status)
   - [`get_websocket_messages`](#get_websocket_messages)
   - [`list_network_requests`](#list_network_requests)
+  - [`start_stream_capture`](#start_stream_capture)
+  - [`stop_stream_capture`](#stop_stream_capture)
 - **[Debugging](#debugging)** (4 tools)
   - [`evaluate_script`](#evaluate_script)
   - [`list_console_messages`](#list_console_messages)
@@ -83,11 +86,12 @@ content is kept for human-readable compatibility.
 
 ### `select_page`
 
-**Description:** Lists or selects open browser pages. Use it without pageIdx to identify the active page or choose the correct tab before inspecting network traffic, scripts, frames, or console output; pass pageIdx to make one listed page the shared target for later tools. It does not navigate or create pages: use [`navigate_page`](#navigate_page) to change the selected page's URL and [`new_page`](#new_page) when a separate tab is required. listPageIdx only paginates the page listing and never changes selection.
+**Description:** Lists or selects open browser pages. Listings return a stable pageId and the current pageIdx. Prefer pageId for later selections because indices can shift when tabs open, close, or reorder; pageIdx remains useful for initial discovery. It does not navigate or create pages: use [`navigate_page`](#navigate_page) to change the selected page's URL and [`new_page`](#new_page) when a separate tab is required. listPageIdx only paginates the page listing and never changes selection.
 
 **Parameters:**
 
 - **listPageIdx** (integer) _(optional)_: Zero-based pagination index for the page listing only. This is not the pageIdx used to select a browser page. Defaults to 0.
+- **pageId** (string) _(optional)_: Stable page handle returned by a previous listing. Prefer this over pageIdx when tabs may open, close, or reorder.
 - **pageIdx** (number) _(optional)_: Snapshot index from the latest page listing. Pass it to make that page the target for later tools; omit it to list pages without changing selection. Re-list after pages open or close because indices can shift.
 - **pageSize** (integer) _(optional)_: Maximum pages to list per response. Defaults to 20.
 
@@ -115,6 +119,23 @@ content is kept for human-readable compatibility.
 **Parameters:**
 
 - **confirm** (boolean) _(optional)_: Must be true to irreversibly delete the selected page's captured request history, response-body cache, and initiator evidence. This confirms capture cleanup, not browser-state cleanup.
+
+---
+
+### `get_stream_status`
+
+**Description:** Ordinary MCP primitive that returns bounded status for a global capture ID. Optional eventPredicate plus afterEventIndex and eventSource matches exact_data, event_name, or json_path_equals against one complete on-disk event sequence and returns only match metadata. It never returns event bodies, credentials, raw bytes, Base64, payload artifacts, or host absolute paths.
+
+**Parameters:**
+
+- **afterEventIndex** (integer) _(optional)_
+- **captureId** (integer) **(required)**
+- **eventPredicate** (unknown) _(optional)_
+- **eventSource** (enum: "raw-stream", "eventsource") _(optional)_
+- **includeRecentChunks** (boolean) _(optional)_
+- **pageIdx** (integer) _(optional)_
+- **pageSize** (integer) _(optional)_
+- **requestId** (string) _(optional)_
 
 ---
 
@@ -153,6 +174,32 @@ content is kept for human-readable compatibility.
 - **reqid** (number) _(optional)_: Inspect one captured request by the reqid returned by request-list or cookie-flow mode. Omit it to list/filter requests or trace cookie setters. Add outputFile when exact, complete, or large data is needed.
 - **resourceTypes** (array) _(optional)_: Filter requests to only return requests of the specified resource types (xhr, fetch, document, script, ...). This is the resource category, NOT the HTTP verb — use methods for GET/POST filtering. When omitted or empty, returns all requests.
 - **urlFilter** (string) _(optional)_: Filter request-list results to URLs containing this substring. Use an endpoint path, host, query fragment, or other known URL text; combine with methods/resourceTypes to narrow an API flow.
+
+---
+
+### `start_stream_capture`
+
+**Description:** MCP primitive that arms stream capture for the selected page. The deployment must configure --allowedRoots and --streamArtifactRoot; the server allocates the directory. A downstream GPT Action backend should call this private MCP tool from its own atomic runBrowserExperiment(capture_flow) implementation.
+
+**Parameters:**
+
+- **artifactNamespace** (string) _(optional)_: Optional backend-supplied experiment namespace. Artifacts are written under experiments/&lt;namespace&gt;/js-reverse/.
+- **includeInFlight** (boolean) _(optional)_: Include requests that started before this capture was armed.
+- **methods** (array) _(optional)_
+- **mimeTypes** (array) _(optional)_
+- **resourceTypes** (array) _(optional)_
+- **urlFilter** (string) _(optional)_
+
+---
+
+### `stop_stream_capture`
+
+**Description:** MCP primitive that stops a global capture ID and waits for activation settlement, queued chunks, network snapshot artifacts, open-file writes, and atomic manifests. It returns only capture.json plus one request metadata artifact per request. A downstream Action backend should call it privately from one atomic capture_flow.
+
+**Parameters:**
+
+- **captureId** (integer) **(required)**
+- **finalizeTimeoutMs** (integer) _(optional)_
 
 ---
 
@@ -380,6 +427,30 @@ content is kept for human-readable compatibility.
 - **`--allowedRoots`**
   Optional directories that local-file tools may read from or write to. Repeat the flag for multiple roots. Roots are resolved at startup and symlink escapes are rejected. While configured, file:, view-source:file:, and filesystem:file: browser pages are disabled. When omitted, local-file access is unrestricted and a security warning is printed.
   - **Type:** string[]
+
+- **`--streamMaxBytes`**
+  Maximum on-disk bytes reserved for one streaming-response capture. Defaults to 536870912 (512 MiB). Exceeding the quota marks the capture failed and records explicit truncation statistics.
+  - **Type:** number
+  - **Default:** `536870912`
+
+- **`--streamArtifactRoot`**
+  Deployment-controlled allowed-root selector used for stream artifacts. Accepts an allowed-root index such as "0" or an exact configured allowed-root path. Required before stream capture can start.
+  - **Type:** string
+
+- **`--streamActivationTimeoutMs`**
+  Internal timeout for Network.streamResourceContent activation. Defaults to 10000ms. Timeout produces a finalized failed or semantic-only manifest instead of leaving a request permanently activating.
+  - **Type:** number
+  - **Default:** `10000`
+
+- **`--streamPendingMaxBytes`**
+  Maximum in-memory bytes queued while streamResourceContent activation is pending. Defaults to 8388608 (8 MiB). Exceeding it fails activation explicitly.
+  - **Type:** number
+  - **Default:** `8388608`
+
+- **`--streamMaxSseEventBytes`**
+  Maximum bytes retained by the semantic SSE parser for one event or incomplete tail. Raw capture continues after semantic parsing degrades. Defaults to 8388608 (8 MiB).
+  - **Type:** number
+  - **Default:** `8388608`
 
 - **`--cloak`**
   Use CloakBrowser stealth-patched Chromium instead of system Chrome. Adds source-level fingerprint patches (canvas/WebGL/audio/GPU). Binary auto-downloads (~200MB) on first use. Identity is persisted per profile in <profile>/.cloak-seed.
