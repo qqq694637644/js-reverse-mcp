@@ -373,7 +373,167 @@ export class PageCollector<T> {
   }
 }
 
-export class ConsoleCollector extends PageCollector<ConsoleMessage | Error> {}
+function runtimeRemoteObjectValue(
+  value: Protocol.Runtime.RemoteObject,
+): unknown {
+  if ('value' in value) {
+    return value.value;
+  }
+  return value.unserializableValue ?? value.description ?? value.type;
+}
+
+function runtimeRemoteObjectText(
+  value: Protocol.Runtime.RemoteObject,
+): string {
+  const resolved = runtimeRemoteObjectValue(value);
+  if (typeof resolved === 'string') {
+    return resolved;
+  }
+  try {
+    return JSON.stringify(resolved);
+  } catch {
+    return String(resolved);
+  }
+}
+
+function createRuntimeConsoleMessage(
+  event: Protocol.Runtime.ConsoleAPICalledEvent,
+): ConsoleMessage {
+  const args = event.args.map(value => runtimeRemoteObjectValue(value));
+  const type = event.type === 'warning' ? 'warn' : event.type;
+  return {
+    type: () => type,
+    text: () => event.args.map(runtimeRemoteObjectText).join(' '),
+    args: () =>
+      args.map(value => ({
+        jsonValue: async () => value,
+      })),
+  } as unknown as ConsoleMessage;
+}
+
+function createRuntimeException(
+  event: Protocol.Runtime.ExceptionThrownEvent,
+): Error {
+  const details = event.exceptionDetails;
+  const message =
+    details.exception?.description ??
+    details.exception?.value ??
+    details.text ??
+    'Uncaught page exception';
+  return new Error(String(message));
+}
+
+export class ConsoleCollector extends PageCollector<ConsoleMessage | Error> {
+  #sessionProvider: CdpSessionProvider;
+  #cdpRequested = false;
+  #cdpListeners = new WeakMap<Page, () => void>();
+  #pageInitializations = new WeakMap<Page, Promise<void>>();
+  #idGenerators = new WeakMap<Page, () => number>();
+
+  constructor(context: BrowserContext, sessionProvider: CdpSessionProvider) {
+    // Shared-CDP browser connections do not reliably surface Playwright's
+    // page.on('console') event. Runtime events are initialized lazily by the
+    // console tool so ordinary navigation stays free of extra CDP domains.
+    super(context, () => ({}));
+    this.#sessionProvider = sessionProvider;
+  }
+
+  override async addPage(page: Page): Promise<void> {
+    await super.addPage(page);
+    if (!this.#idGenerators.has(page)) {
+      this.#idGenerators.set(page, createIdGenerator());
+    }
+    if (this.#cdpRequested) {
+      await this.#setupRuntimeCollection(page);
+    }
+  }
+
+  async initCdp(): Promise<void> {
+    this.#cdpRequested = true;
+    await Promise.all(
+      this.context
+        .pages()
+        .filter(page => this.storage.has(page))
+        .map(page => this.#setupRuntimeCollection(page)),
+    );
+  }
+
+  #setupRuntimeCollection(page: Page): Promise<void> {
+    if (this.#cdpListeners.has(page)) {
+      return Promise.resolve();
+    }
+    const pending = this.#pageInitializations.get(page);
+    if (pending) {
+      return pending;
+    }
+    const initialization = this.#performRuntimeSetup(page).finally(() => {
+      if (this.#pageInitializations.get(page) === initialization) {
+        this.#pageInitializations.delete(page);
+      }
+    });
+    this.#pageInitializations.set(page, initialization);
+    return initialization;
+  }
+
+  async #performRuntimeSetup(page: Page): Promise<void> {
+    const client = await this.#sessionProvider.getSession(page);
+    if (!this.storage.has(page)) {
+      return;
+    }
+    const onConsole = (event: Protocol.Runtime.ConsoleAPICalledEvent): void => {
+      this.#storeRuntimeValue(page, createRuntimeConsoleMessage(event));
+    };
+    const onException = (event: Protocol.Runtime.ExceptionThrownEvent): void => {
+      this.#storeRuntimeValue(page, createRuntimeException(event));
+    };
+    const cleanup = () => {
+      removeCdpEventListener(client, 'Runtime.consoleAPICalled', onConsole);
+      removeCdpEventListener(client, 'Runtime.exceptionThrown', onException);
+    };
+    let attached = false;
+    try {
+      addCdpEventListener(client, 'Runtime.consoleAPICalled', onConsole);
+      addCdpEventListener(client, 'Runtime.exceptionThrown', onException);
+      attached = true;
+      await client.send('Runtime.enable');
+      if (!this.storage.has(page)) {
+        cleanup();
+        return;
+      }
+      this.#cdpListeners.set(page, cleanup);
+    } catch (error) {
+      if (attached) {
+        cleanup();
+      }
+      throw error;
+    }
+  }
+
+  #storeRuntimeValue(page: Page, value: ConsoleMessage | Error): void {
+    const generator = this.#idGenerators.get(page);
+    if (!generator) {
+      return;
+    }
+    const withId = value as WithSymbolId<ConsoleMessage | Error>;
+    withId[stableIdSymbol] = generator();
+    this.store(page, withId);
+  }
+
+  protected override cleanupPageDestroyed(page: Page): void {
+    super.cleanupPageDestroyed(page);
+    const cleanup = this.#cdpListeners.get(page);
+    if (cleanup) {
+      try {
+        cleanup();
+      } catch {
+        // Page or CDP session may already be closed.
+      }
+    }
+    this.#cdpListeners.delete(page);
+    this.#pageInitializations.delete(page);
+    this.#idGenerators.delete(page);
+  }
+}
 
 const cdpRequestIdSymbol = Symbol('cdpRequestId');
 const responseBodyPageSymbol = Symbol('responseBodyPage');

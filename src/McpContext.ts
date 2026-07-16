@@ -113,22 +113,7 @@ export class McpContext implements Context {
 
     this.#consoleCollector = new ConsoleCollector(
       this.browserContext,
-      collect => {
-        return {
-          console: event => {
-            collect(event);
-          },
-          pageerror: event => {
-            if (event instanceof Error) {
-              collect(event);
-            } else {
-              const error = new Error(`${event}`);
-              error.stack = undefined;
-              collect(error);
-            }
-          },
-        } as ListenerMap;
-      },
+      this.sessionProvider,
     );
 
     this.#webSocketCollector = new WebSocketCollector(
@@ -170,15 +155,13 @@ export class McpContext implements Context {
     // Do NOT call it again here — double injection causes scripts to run twice
     // per page load, which can create detectable discrepancies.
 
-    // Initialize Playwright-level listeners early so that page load requests
-    // and console messages are captured immediately. These only register
-    // Node.js event listeners on Playwright objects — no extra CDP domains
-    // are activated, so anti-bot systems cannot detect them.
+    // Initialize page-scoped storage and ordinary network listeners early.
+    // Console Runtime and other CDP-heavy collectors remain lazy.
     await this.#networkCollector.init();
     await this.#consoleCollector.init();
 
-    // NOTE: CDP-heavy collectors (initiator collection, WebSocket CDP events,
-    // Debugger.enable) are NOT initialized here.
+    // NOTE: CDP-heavy collectors (console Runtime events, initiator collection,
+    // WebSocket CDP events, Debugger.enable) are NOT initialized here.
     // They are lazily initialized on first tool use that needs them,
     // via ensureCapabilities(). This prevents unrelated CDP domain activation
     // from leaking automation signals during page navigation.
@@ -205,6 +188,8 @@ export class McpContext implements Context {
       // browser-context event, so "capability ready" also covers current pages.
       if (capability === 'network') {
         await this.#networkCollector.initCdp();
+      } else if (capability === 'console') {
+        await this.#consoleCollector.initCdp();
       } else if (capability === 'websocket') {
         await this.#webSocketCollector.init();
       } else if (capability === 'stream') {
@@ -223,6 +208,9 @@ export class McpContext implements Context {
       switch (capability) {
         case 'network':
           await this.#networkCollector.initCdp();
+          break;
+        case 'console':
+          await this.#consoleCollector.initCdp();
           break;
         case 'websocket':
           await this.#webSocketCollector.init();

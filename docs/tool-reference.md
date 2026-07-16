@@ -223,7 +223,7 @@ content is kept for human-readable compatibility.
 
 ### `list_console_messages`
 
-**Description:** Inspects console messages and uncaught page errors captured for the selected page. Use it to diagnose runtime failures, warnings, application logs, or values already emitted by page code; use [`search_in_sources`](#search_in_sources) for source text and [`list_network_requests`](#list_network_requests) for HTTP evidence instead. Without msgid it lists messages 20 per page by default, optionally filtered by type or retained navigation history. With msgid it returns one message by its stable ID for focused inspection. Capture begins when this MCP attaches and is not retroactive, so reload or reproduce code that logged before attachment.
+**Description:** Inspects console messages and uncaught page errors captured for the selected page. Use it to diagnose runtime failures, warnings, application logs, or values already emitted by page code; use [`search_in_sources`](#search_in_sources) for source text and [`list_network_requests`](#list_network_requests) for HTTP evidence instead. Without msgid it lists messages 20 per page by default, optionally filtered by type or retained navigation history. With msgid it returns one message by its stable ID for focused inspection. CDP console capture begins on the first console tool call and is not retroactive, so establish a checkpoint before reproducing the behavior.
 
 **Parameters:**
 

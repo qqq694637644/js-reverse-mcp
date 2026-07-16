@@ -476,11 +476,7 @@ test('tools declare only their required collector capabilities', () => {
     'network',
     'devtools-ui',
   ]);
-  assert.equal(
-    listConsoleMessages.capabilities,
-    undefined,
-    'console collection uses Playwright listeners and needs no CDP domain',
-  );
+  assert.deepEqual(listConsoleMessages.capabilities, ['console']);
   assert.deepEqual(getWebSocketMessages.capabilities, ['websocket']);
   assert.equal(screenshot.capabilities, undefined);
 });

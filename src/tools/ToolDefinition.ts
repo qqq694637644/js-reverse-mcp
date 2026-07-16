@@ -24,6 +24,7 @@ import type {ToolCategory} from './categories.js';
 
 export const TOOL_CAPABILITIES = [
   'debugger',
+  'console',
   'network',
   'stream',
   'websocket',

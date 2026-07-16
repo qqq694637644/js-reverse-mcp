@@ -10,6 +10,7 @@ import {test} from 'node:test';
 import type {CdpSessionProvider} from '../src/CdpSessionProvider.js';
 import {
   MAX_IN_FLIGHT_BODY_CAPTURES,
+  ConsoleCollector,
   NetworkCollector,
   responseBodyCacheSymbol,
 } from '../src/PageCollector.js';
@@ -188,6 +189,56 @@ test('requests survive navigation (FIFO is navigation-agnostic)', () => {
     collector.getData(page).includes(bundle),
     'request should stay inspectable after navigations',
   );
+});
+
+test('console collector captures CDP runtime messages with stable IDs', async () => {
+  const {page} = createFakePage();
+  const {session} = createFakeCdpSession();
+  const context = {
+    pages: () => [page],
+    on() {
+      return context;
+    },
+    off() {
+      return context;
+    },
+  } as unknown as BrowserContext;
+  const provider = {
+    getSession: async () => session,
+  } as unknown as CdpSessionProvider;
+  const collector = new ConsoleCollector(context, provider);
+
+  await collector.init();
+  await collector.initCdp();
+  session.emit('Runtime.consoleAPICalled', {
+    type: 'warning',
+    args: [{type: 'string', value: 'before checkpoint'}],
+    executionContextId: 1,
+    timestamp: 1,
+  });
+  session.emit('Runtime.consoleAPICalled', {
+    type: 'error',
+    args: [{type: 'string', value: 'after checkpoint'}],
+    executionContextId: 1,
+    timestamp: 2,
+  });
+
+  const messages = collector.getData(page);
+  assert.equal(messages.length, 2);
+  const warning = messages[0] as unknown as {
+    type(): string;
+    text(): string;
+  };
+  const error = messages[1] as unknown as {
+    type(): string;
+    text(): string;
+  };
+  assert.equal(collector.getIdForResource(messages[0]!), 1);
+  assert.equal(collector.getIdForResource(messages[1]!), 2);
+  assert.equal(warning.type(), 'warn');
+  assert.equal(warning.text(), 'before checkpoint');
+  assert.equal(error.type(), 'error');
+  assert.equal(error.text(), 'after checkpoint');
 });
 
 test('evicts the oldest request once past the FIFO cap', () => {
