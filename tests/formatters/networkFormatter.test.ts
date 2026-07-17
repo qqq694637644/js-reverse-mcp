@@ -12,6 +12,7 @@ import {
   getFormattedHeaderEntries,
   getFormattedResponseBody,
   getFormattedSetCookieEntries,
+  getResponseMimeType,
   getSetCookieFlowValues,
   getShortDescriptionForRequestAsync,
   getStatusFromRequestAsync,
@@ -190,6 +191,18 @@ test('falls back to a live body fetch when nothing was cached', async () => {
   const out = await getFormattedResponseBody(response);
   assert.ok(out);
   assert.match(out, /hello world/);
+});
+
+test('extracts normalized response MIME type for structured request lists', async () => {
+  const response = createFinishedResponse({
+    contentType: 'Application/JSON; charset=utf-8',
+  });
+  const request = response.request();
+  Object.assign(request, {
+    timing: () => ({responseEnd: 12}),
+  });
+
+  assert.equal(await getResponseMimeType(request), 'application/json');
 });
 
 function createFinishedResponse(opts: {

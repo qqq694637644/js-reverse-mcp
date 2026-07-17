@@ -176,6 +176,18 @@ export async function getResponseIfCompleted(
   );
 }
 
+export async function getResponseMimeType(
+  request: HTTPRequest,
+): Promise<string | undefined> {
+  const response = await getResponseIfCompleted(request);
+  if (!response) {
+    return undefined;
+  }
+  const value = getHeaderValue(response.headers(), 'content-type');
+  const mimeType = value.split(';', 1)[0]?.trim().toLowerCase();
+  return mimeType || undefined;
+}
+
 export function getShortDescriptionForRequest(
   request: HTTPRequest,
   id: number,

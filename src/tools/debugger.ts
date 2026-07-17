@@ -381,6 +381,19 @@ export const getScriptSource = defineTool({
           response.appendResponseLine('```javascript');
           response.appendResponseLine(content.substring(0, 1000) + '...');
           response.appendResponseLine('```');
+          response.setStructuredContent({
+            scriptId,
+            sourceType: 'javascript',
+            startLine: start + 1,
+            endLine: Math.min(end, lines.length),
+            totalLines: lines.length,
+            startOffset: lineOffset,
+            endOffset: lineOffset + content.length,
+            totalChars: source.length,
+            source: content.substring(0, 1000),
+            truncated: true,
+            nextRecommendedAction: 'use offset/length or save_script_source',
+          });
           return;
         }
 
